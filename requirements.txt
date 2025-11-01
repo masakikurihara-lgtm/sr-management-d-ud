@@ -3,3 +3,4 @@ requests
 pandas
 pytz
 html5lib
+bs4
