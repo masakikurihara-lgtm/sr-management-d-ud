@@ -22,42 +22,53 @@ JST = pytz.timezone('Asia/Tokyo')
 # --- ユーティリティ関数 ---
 
 def get_target_months(years=2):
-    """過去N年間の月リストを 'YYYY年MM月分' 形式で生成する"""
+    """過去N年間の月リストを 'YYYY年MM月分' 形式で生成し、正確なUNIXタイムスタンプを計算する"""
     today = datetime.now(JST)
     months = []
-
-    # === デバッグ検証用（計算ロジックの確認） ===
-    # 2025年10月1日 00:00:00 JST -> 1759244400 (正しい値)
-    test_y, test_m = 2025, 10
-    dt_test = datetime(test_y, test_m, 1, 0, 0, 0, tzinfo=JST)
-    ts_test = int(dt_test.astimezone(pytz.utc).timestamp())
-    logging.info(f"DEBUG: 2025/10/01 00:00:00 JST (計算結果): {ts_test}. 期待値: 1759244400")
-    if ts_test != 1759244400:
-        logging.error("重大エラー: タイムスタンプの計算結果が期待値と一致しません。")
-    # ==========================================
     
     # 選択肢の表示を当月含む過去2年分程度に限定
     for y in range(today.year - years + 1, today.year + 1):
         for m in range(1, 13):
+            # 今後の月は除外
             if y == today.year and m > today.month:
-                continue # 今後の月は除外
+                continue 
             
-            # YYYY年MM月分 (例: 2025年10月分)
             month_str = f"{y}年{m:02d}月分"
             
-            # データ取得のfromパラメータに必要な、対象月の1日00:00:00 JSTのUNIXタイムスタンプを計算
             try:
-                # 対象月の1日 00:00:00 JST
-                dt_obj_jst = datetime(y, m, 1, 0, 0, 0, tzinfo=JST)
+                # 文字列から確実に年と月を取得し直す
+                calc_y = int(month_str[:4])
+                calc_m = int(month_str[5:7])
+
+                # --- タイムスタンプ計算の修正ロジック ---
+                # 1. タイムゾーン情報のないdatetimeオブジェクトを生成
+                dt_naive = datetime(calc_y, calc_m, 1, 0, 0, 0)
                 
-                # JSTのdatetimeオブジェクトをUTCに変換してからtimestampを取得することで、
-                # 正確にJSTの00:00:00を指すUNIXタイムスタンプを得る
-                # これが1759244400になるはずです。
-                timestamp = int(dt_obj_jst.astimezone(pytz.utc).timestamp())
+                # 2. JSTでローカライズ
+                dt_obj_jst = JST.localize(dt_naive, is_dst=None)
                 
+                # 3. UNIXタイムスタンプ（UTC基準）に変換
+                timestamp = int(dt_obj_jst.timestamp()) 
+                
+                # --- デバッグ検証用：2025年10月分の確認 ---
+                if calc_y == 2025 and calc_m == 10:
+                    # 期待値: 1759244400
+                    expected_ts = 1759244400
+                    logging.info(f"DEBUG: 2025/10/01 00:00:00 JST (計算結果): {timestamp}. 期待値: {expected_ts}")
+                    if timestamp != expected_ts:
+                         logging.error(f"重大エラー: 2025年10月の計算結果が期待値と一致しません。計算結果: {timestamp}")
+                # --- デバッグ検証用：2025年9月分の確認 ---
+                if calc_y == 2025 and calc_m == 9:
+                    # 期待値: 1756652400
+                    expected_ts = 1756652400
+                    logging.info(f"DEBUG: 2025/09/01 00:00:00 JST (計算結果): {timestamp}. 期待値: {expected_ts}")
+                    if timestamp != expected_ts:
+                         logging.error(f"重大エラー: 2025年9月の計算結果が期待値と一致しません。計算結果: {timestamp}")
+                # ==========================================
+
                 months.append((month_str, timestamp))
-            except ValueError:
-                # 存在しない月（例: 2月30日など）はスキップ
+            except Exception as e:
+                logging.error(f"日付計算エラー ({month_str}): {e}")
                 continue
                 
     # 最新の月が上に来るように逆順にする
@@ -85,7 +96,7 @@ def fetch_and_process_data(timestamp, cookie_string):
         response.raise_for_status() # HTTPエラーが発生した場合に例外を発生させる
         
         # 2. HTMLからのデータ抽出 (pandas.read_htmlを使用)
-        # HTML内にテーブルデータが存在すると仮定
+        # lxmlがrequirements.txtに追加されているため、正常に動作するはず
         tables = pd.read_html(response.text)
         
         if not tables:
@@ -164,9 +175,16 @@ def fetch_and_process_data(timestamp, cookie_string):
     except requests.HTTPError as e:
         st.error(f"HTTPエラーが発生しました: {e.response.status_code}. 認証Cookieが無効になっている可能性があります。")
         return None
-    except ValueError:
-        st.error("データの抽出に失敗しました。取得したHTML内にテーブルデータが見つからないか、データが期待する形式と異なります。")
-        st.error("`pandas.read_html`が売上テーブルを特定できませんでした。CookieやHTML構造を再確認してください。")
+    except ValueError as e:
+        # lxmlエラーを捕捉し、より具体的なメッセージを表示する
+        if "lxml" in str(e):
+             # requirements.txtが導入されたため、このエラーは発生しないはずですが、念のため捕捉
+             st.error("【重要】データ取得に失敗しました。HTML解析に必要なライブラリ `lxml` が見つかりません。")
+             st.error("Streamlit環境の設定ファイル（`requirements.txt`など）に `lxml` の追加が必要です。")
+             st.stop() # 処理を停止
+        else:
+             st.error("データの抽出に失敗しました。取得したHTML内にテーブルデータが見つからないか、データが期待する形式と異なります。")
+             st.error("`pandas.read_html`が売上テーブルを特定できませんでした。CookieやHTML構造を再確認してください。")
         return None
     except Exception as e:
         st.error(f"予期せぬエラーが発生しました: {e}")
