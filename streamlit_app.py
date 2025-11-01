@@ -14,9 +14,26 @@ logging.basicConfig(level=logging.INFO)
 
 # --- 定数設定 ---
 # タイムチャージ請求書ページのURL
-SR_BASE_URL = "https://www.showroom-live.com/organizer/show_rank_time_charge_hist_invoice_format" 
-# アップロード先ファイル名
-TARGET_FILENAME = "show_rank_time_charge_hist_invoice_format.csv"
+SR_TIME_CHARGE_URL = "https://www.showroom-live.com/organizer/show_rank_time_charge_hist_invoice_format" 
+# プレミアムライブ請求書ページのURL (追加)
+SR_PREMIUM_LIVE_URL = "https://www.showroom-live.com/organizer/paid_live_hist_invoice_format" 
+
+# 処理するデータの種類とそれに対応するURL、ファイル名
+DATA_TYPES = {
+    "time_charge": {
+        "label": "タイムチャージ売上",
+        "url": SR_TIME_CHARGE_URL,
+        # FTPパスの末尾に使用するファイル名部分
+        "filename": "show_rank_time_charge_hist_invoice_format.csv" 
+    },
+    "premium_live": {
+        "label": "プレミアムライブ売上",
+        "url": SR_PREMIUM_LIVE_URL,
+        # FTPパスの末尾に使用するファイル名部分
+        "filename": "paid_live_hist_invoice_format.csv" 
+    }
+}
+
 # 日本のタイムゾーン
 JST = pytz.timezone('Asia/Tokyo')
 
@@ -29,14 +46,25 @@ try:
         "host": st.secrets["ftp"]["host"],
         "user": st.secrets["ftp"]["user"],
         "password": st.secrets["ftp"]["password"],
-        # secretsで設定されたフルパスを使用することを推奨しますが、暫定的に決め打ち
-        "target_path": "/mksoul-pro.com/showroom/sales-app_v2/db/show_rank_time_charge_hist_invoice_format.csv"
+        # secretsで設定されたフルパスを使用することを推奨しますが、
+        # ファイル名を動的に変更するため、ベースパスを設定。
+        # 例: "/mksoul-pro.com/showroom/sales-app_v2/db/"
+        "target_base_path": st.secrets["ftp"]["target_base_path"] 
     }
+    # 既存のtarget_path設定を使用している場合は、ここでベースパスに変換
+    if FTP_CONFIG["target_base_path"].endswith(".csv"):
+        # ファイル名部分を削除して、パスの末尾に"/"を付けてベースパスとする
+        base_path = '/'.join(FTP_CONFIG["target_base_path"].split('/')[:-1]) + '/'
+        FTP_CONFIG["target_base_path"] = base_path
+    
 except KeyError as e:
     # secretsが存在しない場合はダミーを挿入してエラーを表示
     AUTH_COOKIE_STRING = "DUMMY"
     FTP_CONFIG = None
-    st.error(f"🚨 認証またはFTP設定がされていません。`.streamlit/secrets.toml`を確認してください。不足: {e}")
+    if str(e) == "'target_base_path'":
+         st.error(f"🚨 FTP設定が不完全です。`target_path`ではなく`target_base_path`を`.streamlit/secrets.toml`で設定してください。")
+    else:
+        st.error(f"🚨 認証またはFTP設定がされていません。`.streamlit/secrets.toml`を確認してください。不足: {e}")
     st.stop()
 
 
@@ -81,7 +109,7 @@ def get_target_months(years=2):
 
 
 def create_authenticated_session(cookie_string):
-    """手動で取得したCookie文字列から認証済みRequestsセッションを構築する (参照コードと同じロジック)"""
+    """手動で取得したCookie文字列から認証済みRequestsセッションを構築する"""
     st.info("認証セッションを構築します...")
     session = requests.Session()
     try:
@@ -103,23 +131,24 @@ def create_authenticated_session(cookie_string):
         st.error(f"認証セッションを解析中にエラーが発生しました: {e}")
         return None
 
-def fetch_and_process_data(timestamp, cookie_string):
+def fetch_and_process_data(timestamp, cookie_string, sr_url):
     """
     指定されたタイムスタンプに基づいてSHOWROOMからデータを取得し、BeautifulSoupで整形する
+    (関数名を変更し、引数にsr_urlを追加)
     """
-    st.info(f"データ取得中... タイムスタンプ: {timestamp}")
+    st.info(f"データ取得中... URL: {sr_url}, タイムスタンプ: {timestamp}")
     session = create_authenticated_session(cookie_string)
     if not session:
         return None
     
     try:
         # 1. データ取得
-        url = f"{SR_BASE_URL}?from={timestamp}" 
+        url = f"{sr_url}?from={timestamp}" 
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
             'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
-            'Referer': SR_BASE_URL
+            'Referer': sr_url
         }
         
         response = session.get(url, headers=headers, timeout=30)
@@ -135,7 +164,7 @@ def fetch_and_process_data(timestamp, cookie_string):
             if "ログイン" in response.text or "会員登録" in response.text:
                 st.error("🚨 認証切れです。Cookieが古いか無効になっています。")
                 return None
-            st.error("HTMLから売上データテーブル (`table-type-02`) を検出できませんでした。ページ構造が変更されたか、データがまだ生成されていません。")
+            st.warning("HTMLから売上データテーブル (`table-type-02`) を検出できませんでした。ページ構造が変更されたか、データがまだ生成されていません。")
             return None
         
         # 3. データをBeautifulSoupで抽出
@@ -146,8 +175,7 @@ def fetch_and_process_data(timestamp, cookie_string):
         for row in rows[1:]: 
             td_tags = row.find_all('td')
             
-            # --- 抽出ロジックの修正 ---
-            # 添付ファイルと同じ形式にするには、分配額とアカウントIDのみを取得する
+            # --- 抽出ロジック（タイムチャージ/プレミアムライブで共通） ---
             # HTML構造: [0: ルームID, 1: ルームURL, 2: ルーム名, 3: 分配額, 4: アカウントID]
             if len(td_tags) >= 5:
                 # 必要なデータ: 3番目のtd (分配額) と 4番目のtd (アカウントID)
@@ -177,8 +205,8 @@ def fetch_and_process_data(timestamp, cookie_string):
         update_time_str = now_jst.strftime('%Y/%m/%d %H:%M')
         
         # --- CSV形式の再修正ロジック ---
-        # 構造: [分配額], [アカウントID], [更新日時] の3列を全行使用する
-        # ただし、更新日時は1行目のみに記載し、2行目以降は空にする
+        # 構造: [分配額], [アカウントID], [更新日時] の3列
+        # 更新日時は1行目のみに記載し、2行目以降は空にする
         
         # 1. データを格納するための新しいDataFrameを準備
         final_df = pd.DataFrame({
@@ -210,24 +238,23 @@ def fetch_and_process_data(timestamp, cookie_string):
         logging.error("データ取得・整形エラー", exc_info=True)
         return None
 
-def upload_file_ftp(csv_buffer, ftp_config):
+def upload_file_ftp(csv_buffer, ftp_config, full_target_path):
     """
-    FTPサーバーに整形済みCSVファイルをアップロードする
+    FTPサーバーに整形済みCSVファイルをアップロードする (引数にfull_target_pathを追加)
     """
-    st.info(f"FTPサーバー ({ftp_config['host']}) に接続し、ファイルをアップロードします...")
+    st.info(f"FTPサーバー ({ftp_config['host']}) に接続し、ファイルをアップロードします... (パス: {full_target_path})")
     
     try:
         csv_buffer.seek(0)
         # FTP接続
         with FTP(ftp_config['host'], ftp_config['user'], ftp_config['password']) as ftp:
-            # サーバーへアップロード
+            # バイナリデータとしてアップロード
             csv_bytes = csv_buffer.getvalue().encode('utf-8')
             
-            # バイナリデータとしてアップロード
-            ftp.storbinary(f'STOR {ftp_config["target_path"]}', io.BytesIO(csv_bytes))
+            ftp.storbinary(f'STOR {full_target_path}', io.BytesIO(csv_bytes))
             
             st.success(f"✅ ファイルのアップロードが完了しました！")
-            st.markdown(f"**アップロード先:** `{ftp_config['host']}:{ftp_config['target_path']}`")
+            st.markdown(f"**アップロード先:** `{ftp_config['host']}:{full_target_path}`")
             
     except Exception as e:
         st.error(f"FTPアップロード中にエラーが発生しました。設定（ホスト名、ユーザー、パスワード、パス）を確認してください: {e}")
@@ -236,11 +263,40 @@ def upload_file_ftp(csv_buffer, ftp_config):
         
     return True
 
+
+def process_data_type(data_type_key, selected_timestamp, auth_cookie_string, ftp_config):
+    """
+    指定されたデータタイプ（タイムチャージまたはプレミアムライブ）の処理を実行する
+    """
+    data_info = DATA_TYPES[data_type_key]
+    data_label = data_info["label"]
+    sr_url = data_info["url"]
+    filename = data_info["filename"]
+    
+    # FTPアップロード先のフルパスを動的に生成
+    full_target_path = ftp_config["target_base_path"] + filename
+    
+    st.subheader(f"🔄 **{data_label}** の処理を開始します")
+    
+    # 1. データ取得と整形
+    csv_buffer = fetch_and_process_data(selected_timestamp, auth_cookie_string, sr_url)
+    
+    if csv_buffer:
+        # 2. FTPアップロード
+        if ftp_config:
+            upload_file_ftp(csv_buffer, ftp_config, full_target_path)
+        else:
+            st.error("FTP設定が読み込まれていないため、アップロードはスキップされました。")
+    else:
+        st.error(f"{data_label}のデータ取得・整形に失敗したため、アップロードはスキップされました。")
+        
+    st.markdown("---")
+    
 # --- Streamlit UI ---
 
 def main():
     st.set_page_config(page_title="SHOWROOM売上データ アップロードツール", layout="wide")
-    st.title("ライバー売上データ 自動アップロードツール (タイムチャージ)")
+    st.title("ライバー売上データ 自動アップロードツール (タイムチャージ / プレミアムライブ)")
     st.markdown("---")
 
     # 2. 月選択プルダウンの作成
@@ -266,21 +322,18 @@ def main():
     st.header("2. データ取得とアップロードの実行")
     
     # 3. 実行ボタン
-    if st.button("🚀 データ取得・整形・FTPアップロードを実行", type="primary"):
+    if st.button("🚀 タイムチャージ売上 / プレミアムライブ売上の両方を取得・FTPアップロードを実行", type="primary"):
         with st.spinner(f"処理中: {selected_label}のデータを取得しています..."):
             
-            # 1. データ取得と整形
-            csv_buffer = fetch_and_process_data(selected_timestamp, AUTH_COOKIE_STRING)
+            # --- タイムチャージ売上処理 ---
+            process_data_type("time_charge", selected_timestamp, AUTH_COOKIE_STRING, FTP_CONFIG)
             
-            if csv_buffer:
-                # 2. FTPアップロード
-                if FTP_CONFIG:
-                    upload_file_ftp(csv_buffer, FTP_CONFIG)
-                else:
-                    st.error("FTP設定が読み込まれていないため、アップロードはスキップされました。")
-            else:
-                st.error("データ取得・整形に失敗したため、アップロードはスキップされました。")
+            # --- プレミアムライブ売上処理 ---
+            process_data_type("premium_live", selected_timestamp, AUTH_COOKIE_STRING, FTP_CONFIG)
+
+        st.balloons()
+        st.success("🎉 **全ての処理が完了しました！**")
+
 
 if __name__ == "__main__":
-    # FTPライブラリのインポートはmainの外側に移動済み
     main()
