@@ -7,8 +7,8 @@ from ftplib import FTP
 import io
 import pytz
 import logging
-from bs4 import BeautifulSoup # HTML解析のためbs4をインポート
-import re # ルーム売上/KPIの正規表現検索のため追加
+from bs4 import BeautifulSoup 
+import re 
 from typing import List, Dict, Any
 
 # ロギング設定 (デバッグ用)
@@ -48,25 +48,34 @@ DATA_TYPES = {
 # --- KPIデータ設定 ---
 SR_KPI_URL = "https://www.showroom-live.com/organizer/live_kpi"
 KPI_MAX_PAGES = 5
-# KPIデータの保存先ディレクトリ（ユーザー指定のパス構造に基づき絶対パスを定義）
+# KPIデータの保存先ディレクトリ（売上データとは異なる絶対パスを定義）
 KPI_FTP_BASE_PATH = "/mksoul-pro.com/showroom/csv/"
 
 
-# --- 設定ロードと認証 ---
+# --- 設定ロードと認証 (修正) ---
 try:
+    # 既存の共通Cookie（売上3点セット用）
     AUTH_COOKIE_STRING = st.secrets["showroom"]["auth_cookie_string"]
+    
+    # 🚨 修正: KPI専用Cookieの読み込みを試みる
+    try:
+        KPI_AUTH_COOKIE_STRING = st.secrets["showroom"]["kpi_auth_cookie_string"]
+        st.info("KPI専用のCookieが設定されました。KPI処理ではこのCookieを使用します。")
+    except KeyError:
+        # KPI専用Cookieがsecretsにない場合は、共通Cookieをフォールバックとして使用
+        KPI_AUTH_COOKIE_STRING = AUTH_COOKIE_STRING
+        st.warning("KPI専用Cookie (`kpi_auth_cookie_string`) が見つかりません。共通CookieをKPI処理に使用します。")
+
+
     FTP_CONFIG = {
         "host": st.secrets["ftp"]["host"],
         "user": st.secrets["ftp"]["user"],
         "password": st.secrets["ftp"]["password"],
-        # secretsで設定された売上データのベースパス
         "target_base_path": st.secrets["ftp"]["target_base_path"] 
     }
     
     # 売上データのベースパスがディレクトリパス（末尾が'/'）であることを保証
-    # 既存のロジックを流用しつつ、末尾の"/"を保証
     if FTP_CONFIG["target_base_path"].endswith(".csv"):
-        # ファイル名部分を削除して、パスの末尾に"/"を付けてベースパスとする
         base_path = '/'.join(FTP_CONFIG["target_base_path"].split('/')[:-1]) + '/'
         FTP_CONFIG["target_base_path"] = base_path
     elif not FTP_CONFIG["target_base_path"].endswith('/'):
@@ -74,6 +83,7 @@ try:
     
 except KeyError as e:
     AUTH_COOKIE_STRING = "DUMMY"
+    KPI_AUTH_COOKIE_STRING = "DUMMY"
     FTP_CONFIG = None
     if str(e) == "'target_base_path'":
          st.error(f"🚨 FTP設定が不完全です。`target_path`ではなく`target_base_path`を`.streamlit/secrets.toml`で設定してください。")
@@ -106,7 +116,6 @@ def get_sales_months():
             dt_obj_jst = JST.localize(dt_naive, is_dst=None)
             timestamp = int(dt_obj_jst.timestamp()) 
             
-            # 売上ツールはtimestampのみ必要
             months.append((month_str, timestamp)) 
         except Exception as e:
             logging.error(f"売上日付計算エラー ({month_str}): {e}")
@@ -138,10 +147,8 @@ def get_kpi_months():
         month_str = f"{current_year}年{current_month:02d}月分"
         
         try:
-            # dt_naive: その月の1日 00:00:00 のdatetimeオブジェクト
             dt_naive = datetime(current_year, current_month, 1, 0, 0, 0)
             
-            # KPIツールはdt_naive (日付オブジェクト) が必要
             months.append((month_str, dt_naive)) 
         except Exception as e:
             logging.error(f"KPI日付計算エラー ({month_str}): {e}")
@@ -159,13 +166,11 @@ def get_month_start_end_dates(month_dt: datetime) -> tuple[str, str, str]:
     """月の初日 ('YYYY-MM-01') と最終日 ('YYYY-MM-DD')、ファイル名プレフィックス ('YYYY-MM') を計算する"""
     from_date_str = month_dt.strftime('%Y-%m-01')
     
-    # 翌月の1日を計算
     if month_dt.month == 12:
         next_month = month_dt.replace(year=month_dt.year + 1, month=1, day=1)
     else:
         next_month = month_dt.replace(month=month_dt.month + 1, day=1)
         
-    # 翌月1日の前日が最終日
     last_day = next_month - timedelta(days=1)
     to_date_str = last_day.strftime('%Y-%m-%d')
     
@@ -197,7 +202,7 @@ def create_authenticated_session(cookie_string):
         st.error(f"認証セッションを解析中にエラーが発生しました: {e}")
         return None
 
-# --- 売上データ処理ロジック (既存: fetch_and_process_data をリネーム) ---
+# --- 売上データ処理ロジック ---
 
 def fetch_and_process_sales_data(timestamp, cookie_string, sr_url, data_type_key):
     """
@@ -335,19 +340,12 @@ def fetch_and_process_kpi_data(month_dt: datetime, cookie_string: str) -> pd.Dat
     
     from_date_str, to_date_str, file_prefix = get_month_start_end_dates(month_dt)
     st.info(f"KPIデータ取得期間: {from_date_str} から {to_date_str} まで (最大 {KPI_MAX_PAGES} ページ)")
-    session = create_authenticated_session(cookie_string)
+    # process_kpi_toolから渡された専用(またはフォールバック)のcookie_stringを使用
+    session = create_authenticated_session(cookie_string) 
     if not session:
         return None
         
-    # 🚨 認証強化のための修正 🚨
-    # KPIページはパラメータ付きリクエストの前に、ベースURLへのアクセスが必要な場合があるため、セッションを確立させる
-    try:
-        st.info("KPIベースURLにアクセスし、セッション確立を試みます...")
-        session.get(SR_KPI_URL, timeout=10)
-    except Exception as e:
-        # 警告ログを出しつつ続行。セッション自体はクッキーで認証されているため。
-        st.warning(f"KPIベースURLアクセスで警告が発生しましたが続行します: {e}")
-    # 🚨 修正ここまで 
+    # 前回試行したセッションウォームアップ処理は削除し、新Cookieでの認証に集中します。
     
     all_kpi_data: List[Dict[str, Any]] = []
     
@@ -406,14 +404,9 @@ def fetch_and_process_kpi_data(month_dt: datetime, cookie_string: str) -> pd.Dat
                 match_time = re.search(r'(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}).*?\((\d+)m(\d+)s\)', time_data)
 
                 if match_time:
-                    # 配信日時: YYYY/MM/DD HH:MM:SS 形式に変換
                     start_datetime_str = match_time.group(1).replace('-', '/')
-                    
-                    # 配信時間(分): 30秒を境に繰り上げ/切り捨て
                     minutes = int(match_time.group(2))
                     seconds = int(match_time.group(3))
-                    
-                    # 30秒以上は繰り上げ、30秒未満は切り捨て
                     duration_min = minutes + 1 if seconds >= 30 else minutes
                 else:
                     start_datetime_str = ''
@@ -429,7 +422,6 @@ def fetch_and_process_kpi_data(month_dt: datetime, cookie_string: str) -> pd.Dat
                         
                     content = td_tags[i].text.strip()
                     
-                    # 不要な文字の除去 (カンマ、%など)
                     if header in ["合計視聴数", "視聴会員数", "アクション会員数", "獲得支援point", "コメント数", "ギフト数", "フォロワー数", "ルームレベル", "初ルーム来訪者数", "初SR来訪者数", "短時間滞在者数", "フォロワー増減数", "Post人数", "コメント人数", "初コメント人数", "ギフト人数", "初ギフト人数", "期限あり/期限なしSGのギフティング数", "期限あり/期限なしSGのギフティング人数", "期限あり/期限なしSG総額"]:
                         content = content.replace(',', '')
                     elif header == "SPギフト使用会員率":
@@ -452,7 +444,6 @@ def fetch_and_process_kpi_data(month_dt: datetime, cookie_string: str) -> pd.Dat
                 st.success(f"ページ {page_num}: {len(page_data)}件のデータを抽出しました。")
                 all_kpi_data.extend(page_data)
             
-            # 取得件数が1000件未満の場合、データは終了したと判断してループを抜ける
             if len(page_data) < 1000:
                  st.info(f"ページ {page_num} の取得件数が1000件未満だったため、データ取得を終了します。")
                  break
@@ -469,14 +460,25 @@ def fetch_and_process_kpi_data(month_dt: datetime, cookie_string: str) -> pd.Dat
         st.warning("⚠️ 期間内のKPIデータが全く抽出されませんでした。")
         return pd.DataFrame(columns=CSV_HEADERS)
     
-    # DataFrameに変換
     df = pd.DataFrame(all_kpi_data, columns=CSV_HEADERS)
-    return df
+    
+    # 重複除外 (重複除外キーはアカウントID, ルームID, 配信日時, 配信時間(分))
+    dedup_keys = ["アカウントID", "ルームID", "配信日時", "配信時間(分)"]
+    original_count = len(df)
+    df_cleaned = df.drop_duplicates(subset=dedup_keys, keep='first')
+    dedup_count = len(df_cleaned)
+
+    if original_count > dedup_count:
+        st.success(f"データ取得・整形が完了しました。重複データを {original_count - dedup_count} 件除外しました。最終件数: {dedup_count} 件。")
+    else:
+        st.success(f"データ取得・整形が完了しました。最終件数: {dedup_count} 件。")
+
+    return df_cleaned
 
 
-# --- FTPアップロード関数 (既存) ---
-
+# --- FTPアップロード関数 ---
 def upload_file_ftp(csv_buffer, ftp_config, full_target_path):
+    # ... (変更なし) ...
     """
     FTPサーバーに整形済みCSVファイルをアップロードする 
     """
@@ -501,9 +503,10 @@ def upload_file_ftp(csv_buffer, ftp_config, full_target_path):
     return True
 
 
-# --- ラッパー関数 (process_data_type をリネーム) ---
+# --- ラッパー関数 ---
 
 def process_sales_tool(data_type_key, selected_timestamp, auth_cookie_string, ftp_config):
+    # ... (変更なし) ...
     """
     売上データタイプ（タイムチャージ、プレミアムライブ、またはルーム売上）の処理を実行する
     """
@@ -512,7 +515,6 @@ def process_sales_tool(data_type_key, selected_timestamp, auth_cookie_string, ft
     sr_url = data_info["url"]
     filename = data_info["filename"]
     
-    # FTPアップロード先のフルパス
     full_target_path = ftp_config["target_base_path"] + filename
     
     st.subheader(f"🔄 **{data_label}** の処理を開始します")
@@ -530,6 +532,7 @@ def process_sales_tool(data_type_key, selected_timestamp, auth_cookie_string, ft
     st.markdown("---")
 
 def process_kpi_tool(selected_month_dt_list: List[datetime], auth_cookie_string: str, ftp_config: Dict[str, str]):
+    # ... (引数のauth_cookie_stringにはKPI_AUTH_COOKIE_STRINGが渡される) ...
     """
     KPIデータ取得・整形・アップロードの処理を複数月に対して実行する
     """
@@ -538,7 +541,6 @@ def process_kpi_tool(selected_month_dt_list: List[datetime], auth_cookie_string:
         st.warning("⚠️ 処理対象の月が選択されていません。")
         return
         
-    # 選択された月の古い順に処理するため、昇順にソート（2023年9月, 2023年10月, ...）
     selected_month_dt_list.sort() 
     
     st.subheader(f"📊 **配信KPIデータ** の処理を開始します ({len(selected_month_dt_list)}ヶ月分)")
@@ -550,24 +552,21 @@ def process_kpi_tool(selected_month_dt_list: List[datetime], auth_cookie_string:
         from_date_str, to_date_str, file_prefix = get_month_start_end_dates(month_dt)
         target_filename = f"{file_prefix}_all_all.csv"
         
-        # KPIデータ専用のFTPパスを使用
         full_target_path = KPI_FTP_BASE_PATH + target_filename
         
         # 1. データ取得と整形（DataFrameを返す）
-        df_cleaned = fetch_and_process_kpi_data(month_dt, auth_cookie_string)
+        df_cleaned = fetch_and_process_kpi_data(month_dt, auth_cookie_string) # 渡されたCookieを使用
         
         if df_cleaned is not None:
-            # 2. 重複除外は fetch_and_process_kpi_data 内で行われている
             
-            # 3. CSVデータとしてメモリに書き出す
+            # 2. CSVデータとしてメモリに書き出す
             csv_buffer = io.StringIO()
-            # ヘッダーあり、インデックスなし
             df_cleaned.to_csv(csv_buffer, index=False, header=True, encoding='utf-8')
             
             st.success(f"【{month_label}】のデータ整形が完了しました。件数: {len(df_cleaned)}件。")
             st.code(csv_buffer.getvalue()[:2000] + "\n...", language='csv') 
             
-            # 4. FTPアップロード
+            # 3. FTPアップロード
             if ftp_config:
                 upload_file_ftp(csv_buffer, ftp_config, full_target_path)
             else:
@@ -578,7 +577,7 @@ def process_kpi_tool(selected_month_dt_list: List[datetime], auth_cookie_string:
         st.markdown("---")
 
 
-# --- Streamlit UI ---
+# --- Streamlit UI (修正) ---
 
 def main():
     st.set_page_config(page_title="SHOWROOMデータ アップロードツール", layout="wide")
@@ -610,6 +609,7 @@ def main():
     if st.button("🚀 売上データ3種（タイムチャージ/プレミアムライブ/ルーム売上）を取得・FTPアップロードを実行", type="primary"):
         with st.spinner(f"売上データ処理中: {selected_sales_label}のデータを取得しています..."):
             
+            # 共通Cookie (AUTH_COOKIE_STRING) を使用
             process_sales_tool("time_charge", selected_sales_timestamp, AUTH_COOKIE_STRING, FTP_CONFIG)
             process_sales_tool("premium_live", selected_sales_timestamp, AUTH_COOKIE_STRING, FTP_CONFIG)
             process_sales_tool("room_sales", selected_sales_timestamp, AUTH_COOKIE_STRING, FTP_CONFIG)
@@ -625,13 +625,14 @@ def main():
     
     st.header("2. 配信KPIデータ処理対象月選択")
     
+    default_selection = kpi_month_labels[0] if kpi_month_labels else None
+    
     selected_kpi_labels = st.multiselect(
         "配信KPIデータ（2023年9月以降）の処理対象月を複数選択してください:",
         options=kpi_month_labels,
-        default=kpi_month_labels[0] if kpi_month_labels else None # デフォルトで最新の月を選択
+        default=[default_selection] if default_selection else []
     )
     
-    # 選択されたラベルに対応する datetime オブジェクトのリストを生成
     selected_kpi_dt_list = [dt for label, dt in kpi_month_options if label in selected_kpi_labels]
 
     if selected_kpi_labels:
@@ -641,7 +642,8 @@ def main():
     if st.button("📊 配信KPIデータ を取得・FTPアップロードを実行", type="secondary"):
         with st.spinner(f"KPIデータ処理中: 選択された月 ({len(selected_kpi_dt_list)}ヶ月) のKPIデータを取得しています..."):
             
-            process_kpi_tool(selected_kpi_dt_list, AUTH_COOKIE_STRING, FTP_CONFIG)
+            # 🚨 修正: KPI専用Cookie (KPI_AUTH_COOKIE_STRING) を使用
+            process_kpi_tool(selected_kpi_dt_list, KPI_AUTH_COOKIE_STRING, FTP_CONFIG)
 
         st.balloons()
         st.success("🎉 **配信KPIデータの処理が完了しました！**")
