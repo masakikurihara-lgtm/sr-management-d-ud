@@ -8,6 +8,7 @@ import io
 import pytz
 import logging
 from bs4 import BeautifulSoup # HTML解析のためbs4をインポート
+import re # ルーム売上の正規表現検索のため追加
 
 # ロギング設定 (デバッグ用)
 logging.basicConfig(level=logging.INFO)
@@ -81,41 +82,49 @@ except KeyError as e:
 
 # --- ユーティリティ関数 ---
 
-def get_target_months(years=2):
-    """過去N年間の月リストを 'YYYY年MM月分' 形式で生成し、正確なUNIXタイムスタンプを計算する"""
+def get_target_months():
+    """2023年10月以降の月リストを 'YYYY年MM月分' 形式で生成し、正確なUNIXタイムスタンプを計算する"""
+    START_YEAR = 2023
+    START_MONTH = 10
+    
     today = datetime.now(JST)
     months = []
     
-    # 選択肢の表示を当月含む過去2年分程度に限定
-    for y in range(today.year, today.year - years, -1): # 降順で年を処理
-        start_m = 12 if y < today.year else today.month
+    # 処理は現在月から開始し、過去へ遡る
+    current_year = today.year
+    current_month = today.month
+    
+    while True:
+        # 現在処理している月が開始月より前ではないかチェック
+        if current_year < START_YEAR or (current_year == START_YEAR and current_month < START_MONTH):
+            break # 2023年10月より前の月になったらループを終了
+
+        month_str = f"{current_year}年{current_month:02d}月分"
         
-        for m in range(start_m, 0, -1): # 月を降順で処理
+        try:
+            # 1. タイムゾーン情報のないdatetimeオブジェクトを生成
+            # 月の初日を設定
+            dt_naive = datetime(current_year, current_month, 1, 0, 0, 0)
             
-            # 今後の月は除外 (ただし、既に過去の月しか見ていないため実質不要だが念のため)
-            if y == today.year and m > today.month:
-                continue 
+            # 2. JSTでローカライズ
+            # is_dst=None を使用し、曖昧さの解決を強制し、安全なローカライズを保証
+            dt_obj_jst = JST.localize(dt_naive, is_dst=None)
             
-            month_str = f"{y}年{m:02d}月分"
+            # 3. UNIXタイムスタンプ（UTC基準）に変換
+            timestamp = int(dt_obj_jst.timestamp()) 
             
-            try:
-                # 1. タイムゾーン情報のないdatetimeオブジェクトを生成
-                # 月の初日を設定
-                dt_naive = datetime(y, m, 1, 0, 0, 0)
-                
-                # 2. JSTでローカライズ
-                # is_dst=None を使用し、曖昧さの解決を強制し、安全なローカライズを保証
-                dt_obj_jst = JST.localize(dt_naive, is_dst=None)
-                
-                # 3. UNIXタイムスタンプ（UTC基準）に変換
-                timestamp = int(dt_obj_jst.timestamp()) 
-                
-                months.append((month_str, timestamp))
-            except Exception as e:
-                logging.error(f"日付計算エラー ({month_str}): {e}")
-                continue
-                
-    # 最新の月が上に来るようにする（既に降順になっているが念のため）
+            months.append((month_str, timestamp))
+        except Exception as e:
+            logging.error(f"日付計算エラー ({month_str}): {e}")
+            
+        # 次の月（前の月）へ移動
+        if current_month == 1:
+            current_month = 12
+            current_year -= 1
+        else:
+            current_month -= 1
+            
+    # monthsリストは既に最新の月が先頭に来るように降順で作成されている
     return months
 
 
@@ -145,7 +154,6 @@ def create_authenticated_session(cookie_string):
 def fetch_and_process_data(timestamp, cookie_string, sr_url, data_type_key):
     """
     指定されたタイムスタンプに基づいてSHOWROOMからデータを取得し、BeautifulSoupで整形する
-    (引数に data_type_key を追加)
     """
     st.info(f"データ取得中... URL: {sr_url}, タイムスタンプ: {timestamp}")
     session = create_authenticated_session(cookie_string)
@@ -176,7 +184,7 @@ def fetch_and_process_data(timestamp, cookie_string, sr_url, data_type_key):
                 st.error("🚨 認証切れです。Cookieが古いか無効になっています。")
                 return None
             st.warning("HTMLから売上データテーブル (`table-type-02`) を検出できませんでした。ページ構造が変更されたか、データがまだ生成されていません。")
-            # 認証切れではないが、テーブルが発見できない場合は、0件データとして処理を続行するために空のtable_dataのまま次へ進む
+            
         
         # 3. データをBeautifulSoupで抽出 (ライバー個別のデータ)
         table_data = []
@@ -215,8 +223,7 @@ def fetch_and_process_data(timestamp, cookie_string, sr_url, data_type_key):
             if total_amount_tag:
                 # <span>タグを検索して、支払い金額（税抜）を抽出
                 # '支払い金額（税抜）: <span class="fw-b"> 1,182,445円</span><br>'
-                import re
-                
+                                
                 # 支払い金額（税抜）の行を抽出
                 match = re.search(r'支払い金額（税抜）:\s*<span[^>]*>\s*([\d,]+)円', str(total_amount_tag))
                 
@@ -241,7 +248,7 @@ def fetch_and_process_data(timestamp, cookie_string, sr_url, data_type_key):
                 df_cleaned = pd.concat([header_df, driver_df], ignore_index=True)
                 st.success(f"テーブルデータ ({len(driver_df)}件) の抽出と合計値 ({total_amount_str}) の設定が完了しました。")
             else:
-                # ライバーデータが存在しない場合、header_df（1行）のみ
+                # ライバーデータが存在しない場合、header_df（1行）のみ (ゼロ件時も '0,MKsoul,更新日時' になる)
                 df_cleaned = header_df
                 st.warning(f"⚠️ ライバー個別のデータ行を抽出できませんでした。合計値 ({total_amount_str}) と MKsoul のみを含む1行データとして処理を続行します。")
 
