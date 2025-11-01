@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO)
 
 # --- 定数設定 ---
 # 取得元の基本URL
-SR_BASE_BASE_URL = "https://www.showroom-live.com/organizer/show_rank_time_charge_hist_invoice_format"
+SR_BASE_URL = "https://www.showroom-live.com/organizer/show_rank_time_charge_hist_invoice_format" # 変数名を修正
 # アップロード先ファイル名
 TARGET_FILENAME = "show_rank_time_charge_hist_invoice_format.csv"
 # 日本のタイムゾーン
@@ -44,8 +44,9 @@ def get_target_months(years=2):
                 # 正確にJSTの00:00:00を指すUNIXタイムスタンプを得る
                 timestamp = int(dt_obj_jst.astimezone(pytz.utc).timestamp())
                 
-                # 検証用：2025年10月1日 00:00:00 JST -> 1759244400 になることを確認
-                # st.write(f"{month_str}: {timestamp}")
+                # 検証用：
+                # 2025年10月1日 00:00:00 JST -> 1759244400
+                # 2025年9月1日 00:00:00 JST -> 1756652400
                 
                 months.append((month_str, timestamp))
             except ValueError:
@@ -63,7 +64,8 @@ def fetch_and_process_data(timestamp, cookie_string):
     
     try:
         # 1. データ取得
-        url = f"{SR_BASE_URL}?from={timestamp}"
+        # SR_BASE_URLを使用 (修正済み)
+        url = f"{SR_BASE_URL}?from={timestamp}" 
         headers = {
             # 認証に必要なCookieを設定
             "Cookie": cookie_string,
@@ -116,7 +118,10 @@ def fetch_and_process_data(timestamp, cookie_string):
         
         # NaNや合計行などを削除 (分配額が数値でない行を削除するなど)
         # 抽出した分配額の列を文字列に変換し、数値のみを含む行にフィルタリング
-        df_cleaned = df_extracted[df_extracted['分配額'].astype(str).str.isnumeric()].copy()
+        # また、分配額からカンマ(,)を除去してからisnumeric()を適用する処理を追加
+        df_extracted['分配額_cleaned'] = df_extracted['分配額'].astype(str).str.replace(',', '', regex=False)
+        df_cleaned = df_extracted[df_extracted['分配額_cleaned'].str.isnumeric()].copy()
+        df_cleaned['分配額'] = df_cleaned['分配額_cleaned'] # クリーンアップした分配額で上書き
         
         # 4. 特殊なヘッダー行の作成
         
@@ -226,6 +231,7 @@ def main():
         st.warning("有効な月が選択されていません。")
         return
         
+    # 確認のための出力。ここで正しいタイムスタンプが表示されるはずです。
     st.info(f"選択された月: **{selected_label}** (UNIXタイムスタンプ: {selected_timestamp})")
     
     st.header("2. データ取得とアップロードの実行")
