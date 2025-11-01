@@ -1,6 +1,4 @@
 streamlit
 requests
 pandas
-plotly
 pytz
-streamlit-autorefresh
