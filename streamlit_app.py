@@ -347,7 +347,15 @@ def fetch_and_process_kpi_data(month_dt: datetime, cookie_string: str) -> pd.Dat
     csrf_token = None
     try:
         st.info("KPIベースURLにアクセスし、CSRFトークンを抽出します...")
-        base_response = session.get(SR_KPI_URL, timeout=15)
+        # 💡 【追加するヘッダー設定】
+        base_headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36',
+            'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
+            # Refererは不要だが、User-Agentは重要
+        }
+        
+        # base_response = session.get(SR_KPI_URL, timeout=15)  <-- 変更
+        base_response = session.get(SR_KPI_URL, headers=base_headers, timeout=15) # 💡 【変更箇所】
         base_response.raise_for_status()
         
         if "ログイン" in base_response.text:
