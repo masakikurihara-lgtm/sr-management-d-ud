@@ -176,23 +176,20 @@ def fetch_and_process_data(timestamp, cookie_string):
         now_jst = datetime.now(JST)
         update_time_str = now_jst.strftime('%Y/%m/%d %H:%M')
         
-        # 添付ファイル形式: 
-        # 1行目: [更新日時] のみが3列目 (C列) に入る
-        # 2行目以降: [分配額], [アカウントID], [空] の3列
+        # --- CSV形式の再修正ロジック ---
+        # 構造: [分配額], [アカウントID], [更新日時] の3列を全行使用する
+        # ただし、更新日時は1行目のみに記載し、2行目以降は空にする
         
-        # 1. ヘッダー行: [空], [空], [更新日時]
-        # CSVのヘッダー行: [分配額, アカウントID, 更新日時(3列目のみ)]
-        header_row = pd.DataFrame([['', '', update_time_str]], columns=['分配額', 'アカウントID', '更新日時'])
-        
-        # 2. データ行: [分配額], [アカウントID], [空]
-        df_data = pd.DataFrame({
+        # 1. データを格納するための新しいDataFrameを準備
+        final_df = pd.DataFrame({
             '分配額': df_cleaned['分配額'],
             'アカウントID': df_cleaned['アカウントID'],
-            '更新日時': '' # 常に空
+            '更新日時': '' # デフォルトで空文字列
         })
         
-        # ヘッダー行とデータ行を結合
-        final_df = pd.concat([header_row, df_data], ignore_index=True)
+        # 2. 最初のデータ行（インデックス0）の「更新日時」列にのみ、現在時刻を設定
+        if not final_df.empty:
+            final_df.loc[0, '更新日時'] = update_time_str
         
         # CSVデータとして一時的にメモリに書き出す
         csv_buffer = io.StringIO()
@@ -200,7 +197,8 @@ def fetch_and_process_data(timestamp, cookie_string):
         final_df.to_csv(csv_buffer, index=False, header=False, encoding='utf-8')
         
         st.success("データの整形が完了しました。")
-        st.code('\n'.join(csv_buffer.getvalue().split('\n')[:len(final_df) + 1]), language='text') # 整形後のCSV全体をプレビュー
+        # プレビュー表示（ヘッダーなし、インデックスなしのCSV文字列全体）
+        st.code(csv_buffer.getvalue(), language='text') 
         
         return csv_buffer
         
