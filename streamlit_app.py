@@ -24,6 +24,8 @@ SR_TIME_CHARGE_URL = "https://www.showroom-live.com/organizer/show_rank_time_cha
 SR_PREMIUM_LIVE_URL = "https://www.showroom-live.com/organizer/paid_live_hist_invoice_format" 
 SR_ROOM_SALES_URL = "https://www.showroom-live.com/organizer/point_hist_with_mixed_rate" 
 
+SR_ORGANIZER_TOP_URL = "https://www.showroom-live.com/organizer"
+
 DATA_TYPES = {
     "time_charge": {
         "label": "タイムチャージ売上",
@@ -343,23 +345,40 @@ def fetch_and_process_kpi_data(month_dt: datetime, cookie_string: str) -> pd.Dat
     if not session:
         return None
         
-    # 1. ベースページにアクセスし、CSRFトークンなどのセッション情報を取得
+    # 💡 【追加するヘッダー設定】 (AJAXシミュレーションでも使用するため、ここで定義)
+    base_headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36',
+        'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
+    }
+    
+    # 1. Organizerトップページを経由してセッションを確立 (新規追加)
+    try:
+        st.info("Organizerトップページにアクセスし、セッションを確立します...")
+        top_response = session.get(SR_ORGANIZER_TOP_URL, headers=base_headers, timeout=15)
+        top_response.raise_for_status()
+        
+        if "ログイン" in top_response.text:
+            st.error("🚨 トップページアクセス時に認証切れが検出されました。Cookieを再取得してください。")
+            return None
+        st.success("✅ トップページ経由でのセッション確立に成功しました。")
+            
+    except requests.exceptions.RequestException as e:
+        st.error(f"OrganizerトップURLアクセスでエラーが発生しました: {e}。データ取得を中止します。")
+        return None
+
+
+    # 2. ベースページにアクセスし、CSRFトークンなどのセッション情報を取得 (既存ロジックを修正)
     csrf_token = None
     try:
         st.info("KPIベースURLにアクセスし、CSRFトークンを抽出します...")
-        # 💡 【追加するヘッダー設定】
-        base_headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36',
-            'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
-            # Refererは不要だが、User-Agentは重要
-        }
         
-        # base_response = session.get(SR_KPI_URL, timeout=15)  <-- 変更
-        base_response = session.get(SR_KPI_URL, headers=base_headers, timeout=15) # 💡 【変更箇所】
+        # 既存の base_response の呼び出しに base_headers を適用
+        base_response = session.get(SR_KPI_URL, headers=base_headers, timeout=15)
         base_response.raise_for_status()
         
         if "ログイン" in base_response.text:
-            st.error("🚨 ベースURLアクセス時に認証切れが検出されました。Cookieを再取得してください。")
+            # 🚨 トップページ経由で失敗した場合も、ここでエラーを出す
+            st.error("🚨 KPIベースURLアクセス時に認証切れが検出されました。Cookieを再取得してください。")
             return None
             
         base_soup = BeautifulSoup(base_response.text, 'html5lib')
@@ -396,10 +415,13 @@ def fetch_and_process_kpi_data(month_dt: datetime, cookie_string: str) -> pd.Dat
             # 2. AJAXリクエストヘッダーの設定
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image:apng,*/*;q=0.8',
                 'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
-                'Referer': SR_KPI_URL,
-                'X-Requested-With': 'XMLHttpRequest' # 🚨 AJAXリクエストであることを通知するヘッダー
+                
+                # 💡 【RefererをトップページURLに設定】
+                'Referer': SR_ORGANIZER_TOP_URL, 
+                
+                'X-Requested-With': 'XMLHttpRequest' 
             }
             
             # CSRFトークンが存在すれば、ヘッダーに追加する
