@@ -8,69 +8,71 @@ import io
 import pytz
 import logging
 from bs4 import BeautifulSoup # HTML解析のためbs4をインポート
-import re # ルーム売上の正規表現検索のため追加
+import re # ルーム売上/KPIの正規表現検索のため追加
+from typing import List, Dict, Any
 
 # ロギング設定 (デバッグ用)
 logging.basicConfig(level=logging.INFO)
 
+# 日本のタイムゾーン
+JST = pytz.timezone('Asia/Tokyo')
+
 # --- 定数設定 ---
-# タイムチャージ請求書ページのURL
+
+# --- 売上データ設定 ---
 SR_TIME_CHARGE_URL = "https://www.showroom-live.com/organizer/show_rank_time_charge_hist_invoice_format" 
-# プレミアムライブ請求書ページのURL (追加)
 SR_PREMIUM_LIVE_URL = "https://www.showroom-live.com/organizer/paid_live_hist_invoice_format" 
-# ルーム売上請求書ページのURL (追加)
 SR_ROOM_SALES_URL = "https://www.showroom-live.com/organizer/point_hist_with_mixed_rate" 
 
-# 処理するデータの種類とそれに対応するURL、ファイル名
 DATA_TYPES = {
     "time_charge": {
         "label": "タイムチャージ売上",
         "url": SR_TIME_CHARGE_URL,
-        # FTPパスの末尾に使用するファイル名部分
         "filename": "show_rank_time_charge_hist_invoice_format.csv",
         "type": "standard" 
     },
     "premium_live": {
         "label": "プレミアムライブ売上",
         "url": SR_PREMIUM_LIVE_URL,
-        # FTPパスの末尾に使用するファイル名部分
         "filename": "paid_live_hist_invoice_format.csv",
         "type": "standard"
     },
-    "room_sales": { # ルーム売上を追加
+    "room_sales": { 
         "label": "ルーム売上",
         "url": SR_ROOM_SALES_URL,
-        # FTPパスの末尾に使用するファイル名部分
         "filename": "point_hist_with_mixed_rate_csv_donwload_for_room.csv",
         "type": "room_sales"
     }
 }
 
-# 日本のタイムゾーン
-JST = pytz.timezone('Asia/Tokyo')
+# --- KPIデータ設定 ---
+SR_KPI_URL = "https://www.showroom-live.com/organizer/live_kpi"
+KPI_MAX_PAGES = 5
+# KPIデータの保存先ディレクトリ（ユーザー指定のパス構造に基づき絶対パスを定義）
+KPI_FTP_BASE_PATH = "/mksoul-pro.com/showroom/csv/"
+
 
 # --- 設定ロードと認証 ---
 try:
-    # オーガナイザーCookieを取得
     AUTH_COOKIE_STRING = st.secrets["showroom"]["auth_cookie_string"]
-    # FTP設定
     FTP_CONFIG = {
         "host": st.secrets["ftp"]["host"],
         "user": st.secrets["ftp"]["user"],
         "password": st.secrets["ftp"]["password"],
-        # secretsで設定されたフルパスを使用することを推奨しますが、
-        # ファイル名を動的に変更するため、ベースパスを設定。
-        # 例: "/mksoul-pro.com/showroom/sales-app_v2/db/"
+        # secretsで設定された売上データのベースパス
         "target_base_path": st.secrets["ftp"]["target_base_path"] 
     }
-    # 既存のtarget_path設定を使用している場合は、ここでベースパスに変換
+    
+    # 売上データのベースパスがディレクトリパス（末尾が'/'）であることを保証
+    # 既存のロジックを流用しつつ、末尾の"/"を保証
     if FTP_CONFIG["target_base_path"].endswith(".csv"):
         # ファイル名部分を削除して、パスの末尾に"/"を付けてベースパスとする
         base_path = '/'.join(FTP_CONFIG["target_base_path"].split('/')[:-1]) + '/'
         FTP_CONFIG["target_base_path"] = base_path
+    elif not FTP_CONFIG["target_base_path"].endswith('/'):
+         FTP_CONFIG["target_base_path"] += '/'
     
 except KeyError as e:
-    # secretsが存在しない場合はダミーを挿入してエラーを表示
     AUTH_COOKIE_STRING = "DUMMY"
     FTP_CONFIG = None
     if str(e) == "'target_base_path'":
@@ -82,50 +84,94 @@ except KeyError as e:
 
 # --- ユーティリティ関数 ---
 
-def get_target_months():
-    """2023年10月以降の月リストを 'YYYY年MM月分' 形式で生成し、正確なUNIXタイムスタンプを計算する"""
+def get_sales_months():
+    """売上データ用: 2023年10月以降の月リストを 'YYYY年MM月分' 形式で生成し、UNIXタイムスタンプを計算する"""
     START_YEAR = 2023
-    START_MONTH = 10
+    START_MONTH = 10 # 売上データは10月開始
     
     today = datetime.now(JST)
     months = []
     
-    # 処理は現在月から開始し、過去へ遡る
     current_year = today.year
     current_month = today.month
     
     while True:
-        # 現在処理している月が開始月より前ではないかチェック
         if current_year < START_YEAR or (current_year == START_YEAR and current_month < START_MONTH):
-            break # 2023年10月より前の月になったらループを終了
+            break
 
         month_str = f"{current_year}年{current_month:02d}月分"
         
         try:
-            # 1. タイムゾーン情報のないdatetimeオブジェクトを生成
-            # 月の初日を設定
             dt_naive = datetime(current_year, current_month, 1, 0, 0, 0)
-            
-            # 2. JSTでローカライズ
-            # is_dst=None を使用し、曖昧さの解決を強制し、安全なローカライズを保証
             dt_obj_jst = JST.localize(dt_naive, is_dst=None)
-            
-            # 3. UNIXタイムスタンプ（UTC基準）に変換
             timestamp = int(dt_obj_jst.timestamp()) 
             
-            months.append((month_str, timestamp))
+            # 売上ツールはtimestampのみ必要
+            months.append((month_str, timestamp)) 
         except Exception as e:
-            logging.error(f"日付計算エラー ({month_str}): {e}")
+            logging.error(f"売上日付計算エラー ({month_str}): {e}")
             
-        # 次の月（前の月）へ移動
         if current_month == 1:
             current_month = 12
             current_year -= 1
         else:
             current_month -= 1
             
-    # monthsリストは既に最新の月が先頭に来るように降順で作成されている
     return months
+
+
+def get_kpi_months():
+    """KPIデータ用: 2023年9月以降の月リストを 'YYYY年MM月分' 形式で生成し、datetimeオブジェクトを計算する"""
+    START_YEAR = 2023
+    START_MONTH = 9 # KPIデータは9月開始
+    
+    today = datetime.now(JST)
+    months = []
+    
+    current_year = today.year
+    current_month = today.month
+    
+    while True:
+        if current_year < START_YEAR or (current_year == START_YEAR and current_month < START_MONTH):
+            break
+
+        month_str = f"{current_year}年{current_month:02d}月分"
+        
+        try:
+            # dt_naive: その月の1日 00:00:00 のdatetimeオブジェクト
+            dt_naive = datetime(current_year, current_month, 1, 0, 0, 0)
+            
+            # KPIツールはdt_naive (日付オブジェクト) が必要
+            months.append((month_str, dt_naive)) 
+        except Exception as e:
+            logging.error(f"KPI日付計算エラー ({month_str}): {e}")
+            
+        if current_month == 1:
+            current_month = 12
+            current_year -= 1
+        else:
+            current_month -= 1
+            
+    return months
+
+
+def get_month_start_end_dates(month_dt: datetime) -> tuple[str, str, str]:
+    """月の初日 ('YYYY-MM-01') と最終日 ('YYYY-MM-DD')、ファイル名プレフィックス ('YYYY-MM') を計算する"""
+    from_date_str = month_dt.strftime('%Y-%m-01')
+    
+    # 翌月の1日を計算
+    if month_dt.month == 12:
+        next_month = month_dt.replace(year=month_dt.year + 1, month=1, day=1)
+    else:
+        next_month = month_dt.replace(month=month_dt.month + 1, day=1)
+        
+    # 翌月1日の前日が最終日
+    last_day = next_month - timedelta(days=1)
+    to_date_str = last_day.strftime('%Y-%m-%d')
+    
+    file_prefix = month_dt.strftime('%Y-%m')
+    
+    return from_date_str, to_date_str, file_prefix
 
 
 def create_authenticated_session(cookie_string):
@@ -151,9 +197,11 @@ def create_authenticated_session(cookie_string):
         st.error(f"認証セッションを解析中にエラーが発生しました: {e}")
         return None
 
-def fetch_and_process_data(timestamp, cookie_string, sr_url, data_type_key):
+# --- 売上データ処理ロジック (既存: fetch_and_process_data をリネーム) ---
+
+def fetch_and_process_sales_data(timestamp, cookie_string, sr_url, data_type_key):
     """
-    指定されたタイムスタンプに基づいてSHOWROOMからデータを取得し、BeautifulSoupで整形する
+    指定されたタイムスタンプに基づいてSHOWROOMから売上データを取得し、BeautifulSoupで整形する
     """
     st.info(f"データ取得中... URL: {sr_url}, タイムスタンプ: {timestamp}")
     session = create_authenticated_session(cookie_string)
@@ -171,12 +219,10 @@ def fetch_and_process_data(timestamp, cookie_string, sr_url, data_type_key):
         }
         
         response = session.get(url, headers=headers, timeout=30)
-        response.raise_for_status() # HTTPエラーが発生した場合に例外を発生させる
+        response.raise_for_status() 
         
         # 2. HTMLからのデータ抽出
         soup = BeautifulSoup(response.text, 'html5lib') 
-        
-        # 売上データが格納されているテーブルをクラス名で特定 (table-type-02)
         table = soup.find('table', class_='table-type-02') 
         
         if not table:
@@ -188,26 +234,18 @@ def fetch_and_process_data(timestamp, cookie_string, sr_url, data_type_key):
         
         # 3. データをBeautifulSoupで抽出 (ライバー個別のデータ)
         table_data = []
-        # tableがNoneでない場合にのみ行を抽出
         if table:
             rows = table.find_all('tr')
             
-            # ヘッダー行をスキップし、データ行のみを処理 (rows[1:]から開始)
             for row in rows[1:]: 
                 td_tags = row.find_all('td')
                 
-                # --- 抽出ロジック（タイムチャージ/プレミアムライブ/ルーム売上で共通） ---
-                # HTML構造: [0: ルームID, 1: ルームURL, 2: ルーム名, 3: 分配額, 4: アカウントID]
                 if len(td_tags) >= 5:
-                    # 必要なデータ: 3番目のtd (分配額) と 4番目のtd (アカウントID)
-                    # 分配額はカンマを除去
                     amount_str = td_tags[3].text.strip().replace(',', '') 
                     account_id = td_tags[4].text.strip()
                     
-                    # 分配額が数値であることを確認（合計行などを除外）
                     if amount_str.isnumeric():
                          table_data.append({
-                            # CSVの列順に合わせて名前を付ける
                             '分配額': amount_str, 
                             'アカウントID': account_id
                         })
@@ -217,38 +255,28 @@ def fetch_and_process_data(timestamp, cookie_string, sr_url, data_type_key):
         # 4-A. ルーム売上の特殊ロジック
         if data_type_key == "room_sales":
             
-            # 1. 支払い金額（税抜）の抽出 (1行目1列目の値)
             total_amount_tag = soup.find('p', class_='fs-b4 bg-light-gray p-b3 mb-b2 link-light-green')
-            total_amount_str = '0' # デフォルト値を '0' に設定
+            total_amount_str = '0'
             if total_amount_tag:
-                # <span>タグを検索して、支払い金額（税抜）を抽出
-                # '支払い金額（税抜）: <span class="fw-b"> 1,182,445円</span><br>'
-                                
-                # 支払い金額（税抜）の行を抽出
                 match = re.search(r'支払い金額（税抜）:\s*<span[^>]*>\s*([\d,]+)円', str(total_amount_tag))
                 
                 if match:
-                    # カンマと '円' を除去
                     total_amount_str = match.group(1).replace(',', '') 
                 else:
                     st.warning("⚠️ HTMLから「支払い金額（税抜）」の値を抽出できませんでした。分配額を「0」として処理を続行します。")
                     
-            # 2. 1行目のヘッダーデータを作成 (合計値 + MKsoul)
             header_data = [{
                 '分配額': total_amount_str,
                 'アカウントID': 'MKsoul'
             }]
             
-            # 3. ライバー個別のデータと結合
             header_df = pd.DataFrame(header_data)
             
             if table_data:
-                # ライバーデータが存在する場合、header_dfの後ろに連結
                 driver_df = pd.DataFrame(table_data)
                 df_cleaned = pd.concat([header_df, driver_df], ignore_index=True)
                 st.success(f"テーブルデータ ({len(driver_df)}件) の抽出と合計値 ({total_amount_str}) の設定が完了しました。")
             else:
-                # ライバーデータが存在しない場合、header_df（1行）のみ (ゼロ件時も '0,MKsoul,更新日時' になる)
                 df_cleaned = header_df
                 st.warning(f"⚠️ ライバー個別のデータ行を抽出できませんでした。合計値 ({total_amount_str}) と MKsoul のみを含む1行データとして処理を続行します。")
 
@@ -258,10 +286,9 @@ def fetch_and_process_data(timestamp, cookie_string, sr_url, data_type_key):
             if not table_data:
                 st.warning("⚠️ テーブルから有効なデータ行を抽出できませんでした。分配額=0、アカウントID=dummyを含む1行データとして処理を続行します。")
                 
-                # ゼロ件データ用のDataFrameを作成。分配額=0、アカウントID=dummyを設定
                 df_cleaned = pd.DataFrame([{
-                    '分配額': '0',       # 分配額: 0 (文字列)
-                    'アカウントID': 'dummy' # アカウントID: dummy
+                    '分配額': '0',       
+                    'アカウントID': 'dummy' 
                 }])
                 
             else:
@@ -273,28 +300,19 @@ def fetch_and_process_data(timestamp, cookie_string, sr_url, data_type_key):
         now_jst = datetime.now(JST)
         update_time_str = now_jst.strftime('%Y/%m/%d %H:%M')
         
-        # --- CSV形式の再修正ロジック ---
-        # 構造: [分配額], [アカウントID], [更新日時] の3列
-        # 更新日時は1行目のみに記載し、2行目以降は空にする
-        
-        # 1. データを格納するための新しいDataFrameを準備
         final_df = pd.DataFrame({
             '分配額': df_cleaned['分配額'],
             'アカウントID': df_cleaned['アカウントID'],
-            '更新日時': '' # デフォルトで空文字列
+            '更新日時': '' 
         })
         
-        # 2. 最初のデータ行（インデックス0）の「更新日時」列にのみ、現在時刻を設定
         if not final_df.empty:
             final_df.loc[0, '更新日時'] = update_time_str
         
-        # CSVデータとして一時的にメモリに書き出す
         csv_buffer = io.StringIO()
-        # UTF-8、ヘッダーなし、インデックスなし
         final_df.to_csv(csv_buffer, index=False, header=False, encoding='utf-8')
         
         st.success("データの整形が完了しました。")
-        # プレビュー表示（ヘッダーなし、インデックスなしのCSV文字列全体）
         st.code(csv_buffer.getvalue(), language='text') 
         
         return csv_buffer
@@ -307,6 +325,147 @@ def fetch_and_process_data(timestamp, cookie_string, sr_url, data_type_key):
         logging.error("データ取得・整形エラー", exc_info=True)
         return None
 
+
+# --- KPIデータ処理ロジック (新規) ---
+
+def fetch_and_process_kpi_data(month_dt: datetime, cookie_string: str) -> pd.DataFrame or None:
+    """
+    指定された月（month_dt）に基づいてKPIデータを最大5ページ取得し、整形を行う
+    """
+    
+    from_date_str, to_date_str, file_prefix = get_month_start_end_dates(month_dt)
+    st.info(f"KPIデータ取得期間: {from_date_str} から {to_date_str} まで (最大 {KPI_MAX_PAGES} ページ)")
+    session = create_authenticated_session(cookie_string)
+    if not session:
+        return None
+    
+    all_kpi_data: List[Dict[str, Any]] = []
+    
+    CSV_HEADERS = [
+        "アカウントID", "ルームID", "配信日時", "配信時間(分)", "連続配信日数", "ルーム名", 
+        "合計視聴数", "視聴会員数", "アクション会員数", "SPギフト使用会員率", "初ルーム来訪者数", 
+        "初SR来訪者数", "短時間滞在者数", "ルームレベル", "フォロワー数", "フォロワー増減数", 
+        "Post人数", "獲得支援point", "コメント数", "コメント人数", "初コメント人数", 
+        "ギフト数", "ギフト人数", "初ギフト人数", "期限あり/期限なしSGのギフティング数", 
+        "期限あり/期限なしSGのギフティング人数", "期限あり/期限なしSG総額", "2023年9月以前のおまけ分(無償SG RS外)"
+    ]
+    
+    # ページネーションループ
+    for page_num in range(1, KPI_MAX_PAGES + 1):
+        try:
+            url = (f"{SR_KPI_URL}?page={page_num}&room_id=&from_date={from_date_str}&to_date={to_date_str}")
+            st.info(f"➡️ ページ {page_num} を取得中...")
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
+                'Referer': SR_KPI_URL
+            }
+            
+            response = session.get(url, headers=headers, timeout=30)
+            response.raise_for_status() 
+            
+            soup = BeautifulSoup(response.text, 'html5lib') 
+            table = soup.find('table', class_='table-type-02') 
+            
+            if not table:
+                if "ログイン" in response.text:
+                    st.error("🚨 認証切れです。Cookieが古いか無効になっています。")
+                    return None
+                st.warning(f"ページ {page_num}: データテーブルを検出できませんでした。データが終了したか、ページ構造が変更されています。")
+                break 
+
+            rows = table.find_all('tr')
+            
+            page_data = []
+            if len(rows) <= 1: 
+                st.info(f"ページ {page_num}: 有効なデータ行がありませんでした。取得を終了します。")
+                break 
+
+            for row in rows[1:]: 
+                td_tags = row.find_all('td')
+                
+                if len(td_tags) != 28:
+                    continue 
+
+                row_data: Dict[str, Any] = {}
+                
+                # 配信日時と配信時間(分)の特殊処理 (インデックス2)
+                time_data = td_tags[2].text.strip()
+                match_time = re.search(r'(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}).*?\((\d+)m(\d+)s\)', time_data)
+
+                if match_time:
+                    # 配信日時: YYYY/MM/DD HH:MM:SS 形式に変換
+                    start_datetime_str = match_time.group(1).replace('-', '/')
+                    
+                    # 配信時間(分): 30秒を境に繰り上げ/切り捨て
+                    minutes = int(match_time.group(2))
+                    seconds = int(match_time.group(3))
+                    
+                    # 30秒以上は繰り上げ、30秒未満は切り捨て
+                    duration_min = minutes + 1 if seconds >= 30 else minutes
+                else:
+                    start_datetime_str = ''
+                    duration_min = 0
+
+                row_data["配信日時"] = start_datetime_str
+                row_data["配信時間(分)"] = str(duration_min)
+                
+                # その他の列の抽出
+                for i, header in enumerate(CSV_HEADERS):
+                    if i == 2 or header == "配信時間(分)":
+                        continue
+                        
+                    content = td_tags[i].text.strip()
+                    
+                    # 不要な文字の除去 (カンマ、%など)
+                    if header in ["合計視聴数", "視聴会員数", "アクション会員数", "獲得支援point", "コメント数", "ギフト数", "フォロワー数", "ルームレベル", "初ルーム来訪者数", "初SR来訪者数", "短時間滞在者数", "フォロワー増減数", "Post人数", "コメント人数", "初コメント人数", "ギフト人数", "初ギフト人数", "期限あり/期限なしSGのギフティング数", "期限あり/期限なしSGのギフティング人数", "期限あり/期限なしSG総額"]:
+                        content = content.replace(',', '')
+                    elif header == "SPギフト使用会員率":
+                        content = content.replace('%', '')
+                    elif header == "ルーム名":
+                        div_tag = td_tags[i].find('div')
+                        if div_tag:
+                            content = div_tag.text.strip()
+
+                    if i in [0, 1]:
+                        a_tag = td_tags[i].find('a')
+                        if a_tag:
+                            content = a_tag.text.strip()
+                        
+                    row_data[header] = content
+                    
+                page_data.append(row_data)
+
+            if page_data:
+                st.success(f"ページ {page_num}: {len(page_data)}件のデータを抽出しました。")
+                all_kpi_data.extend(page_data)
+            
+            # 取得件数が1000件未満の場合、データは終了したと判断してループを抜ける
+            if len(page_data) < 1000:
+                 st.info(f"ページ {page_num} の取得件数が1000件未満だったため、データ取得を終了します。")
+                 break
+
+        except requests.exceptions.HTTPError as e:
+            st.error(f"ページ {page_num} でHTTPエラーが発生しました: {e.response.status_code}. 認証Cookieが無効になっている可能性があります。")
+            return None
+        except Exception as e:
+            st.error(f"ページ {page_num} で予期せぬエラーが発生しました: {e}")
+            logging.error(f"KPIデータ取得エラー (ページ {page_num})", exc_info=True)
+            return None
+    
+    if not all_kpi_data:
+        st.warning("⚠️ 期間内のKPIデータが全く抽出されませんでした。")
+        return pd.DataFrame(columns=CSV_HEADERS)
+    
+    # DataFrameに変換
+    df = pd.DataFrame(all_kpi_data, columns=CSV_HEADERS)
+    return df
+
+
+# --- FTPアップロード関数 (既存) ---
+
 def upload_file_ftp(csv_buffer, ftp_config, full_target_path):
     """
     FTPサーバーに整形済みCSVファイルをアップロードする 
@@ -317,7 +476,6 @@ def upload_file_ftp(csv_buffer, ftp_config, full_target_path):
         csv_buffer.seek(0)
         # FTP接続
         with FTP(ftp_config['host'], ftp_config['user'], ftp_config['password']) as ftp:
-            # バイナリデータとしてアップロード
             csv_bytes = csv_buffer.getvalue().encode('utf-8')
             
             ftp.storbinary(f'STOR {full_target_path}', io.BytesIO(csv_bytes))
@@ -333,79 +491,150 @@ def upload_file_ftp(csv_buffer, ftp_config, full_target_path):
     return True
 
 
-def process_data_type(data_type_key, selected_timestamp, auth_cookie_string, ftp_config):
+# --- ラッパー関数 (process_data_type をリネーム) ---
+
+def process_sales_tool(data_type_key, selected_timestamp, auth_cookie_string, ftp_config):
     """
-    指定されたデータタイプ（タイムチャージ、プレミアムライブ、またはルーム売上）の処理を実行する
+    売上データタイプ（タイムチャージ、プレミアムライブ、またはルーム売上）の処理を実行する
     """
     data_info = DATA_TYPES[data_type_key]
     data_label = data_info["label"]
     sr_url = data_info["url"]
     filename = data_info["filename"]
     
-    # FTPアップロード先のフルパスを動的に生成
+    # FTPアップロード先のフルパス
     full_target_path = ftp_config["target_base_path"] + filename
     
     st.subheader(f"🔄 **{data_label}** の処理を開始します")
     
-    # 1. データ取得と整形 (data_type_keyを渡す)
-    csv_buffer = fetch_and_process_data(selected_timestamp, auth_cookie_string, sr_url, data_type_key)
+    csv_buffer = fetch_and_process_sales_data(selected_timestamp, auth_cookie_string, sr_url, data_type_key)
     
     if csv_buffer:
-        # 2. FTPアップロード
         if ftp_config:
             upload_file_ftp(csv_buffer, ftp_config, full_target_path)
         else:
             st.error("FTP設定が読み込まれていないため、アップロードはスキップされました。")
     else:
-        # fetch_and_process_dataがエラーなどでNoneを返した場合のみ実行される
         st.error(f"{data_label}のデータ取得・整形に失敗したため、アップロードはスキップされました。")
         
     st.markdown("---")
+
+def process_kpi_tool(selected_month_dt_list: List[datetime], auth_cookie_string: str, ftp_config: Dict[str, str]):
+    """
+    KPIデータ取得・整形・アップロードの処理を複数月に対して実行する
+    """
     
+    if not selected_month_dt_list:
+        st.warning("⚠️ 処理対象の月が選択されていません。")
+        return
+        
+    # 選択された月の古い順に処理するため、昇順にソート（2023年9月, 2023年10月, ...）
+    selected_month_dt_list.sort() 
+    
+    st.subheader(f"📊 **配信KPIデータ** の処理を開始します ({len(selected_month_dt_list)}ヶ月分)")
+    
+    for month_dt in selected_month_dt_list:
+        month_label = month_dt.strftime('%Y年%m月分')
+        st.info(f"--- {month_label} の処理 ---")
+        
+        from_date_str, to_date_str, file_prefix = get_month_start_end_dates(month_dt)
+        target_filename = f"{file_prefix}_all_all.csv"
+        
+        # KPIデータ専用のFTPパスを使用
+        full_target_path = KPI_FTP_BASE_PATH + target_filename
+        
+        # 1. データ取得と整形（DataFrameを返す）
+        df_cleaned = fetch_and_process_kpi_data(month_dt, auth_cookie_string)
+        
+        if df_cleaned is not None:
+            # 2. 重複除外は fetch_and_process_kpi_data 内で行われている
+            
+            # 3. CSVデータとしてメモリに書き出す
+            csv_buffer = io.StringIO()
+            # ヘッダーあり、インデックスなし
+            df_cleaned.to_csv(csv_buffer, index=False, header=True, encoding='utf-8')
+            
+            st.success(f"【{month_label}】のデータ整形が完了しました。件数: {len(df_cleaned)}件。")
+            st.code(csv_buffer.getvalue()[:2000] + "\n...", language='csv') 
+            
+            # 4. FTPアップロード
+            if ftp_config:
+                upload_file_ftp(csv_buffer, ftp_config, full_target_path)
+            else:
+                st.error("FTP設定が読み込まれていないため、アップロードはスキップされました。")
+        else:
+            st.error(f"【{month_label}】のデータ取得・整形に失敗したため、アップロードはスキップされました。")
+            
+        st.markdown("---")
+
+
 # --- Streamlit UI ---
 
 def main():
-    st.set_page_config(page_title="SHOWROOM売上データ アップロードツール", layout="wide")
-    st.title("ライバー売上データ 自動アップロードツール (タイムチャージ / プレミアムライブ / ルーム売上)")
+    st.set_page_config(page_title="SHOWROOMデータ アップロードツール", layout="wide")
+    st.title("SHOWROOMデータ 自動アップロードツール (売上3種 & 配信KPI)")
     st.markdown("---")
 
-    # 2. 月選択プルダウンの作成
-    month_options = get_target_months()
-    month_labels = [label for label, _ in month_options]
     
-    st.header("1. 対象月選択")
+    # 1. 売上データ用の月選択 (2023年10月以降、シングルセレクト)
+    sales_month_options = get_sales_months()
+    sales_month_labels = [label for label, _ in sales_month_options]
     
-    selected_label = st.selectbox(
-        "処理対象の配信月を選択してください:",
-        options=month_labels,
-        index=0 # デフォルトで最新の月を選択
+    st.header("1. 売上データ（3種）処理対象月選択")
+    
+    selected_sales_label = st.selectbox(
+        "売上データ（2023年10月以降）の処理対象月を選択してください:",
+        options=sales_month_labels,
+        index=0 
     )
     
-    selected_timestamp = next((ts for label, ts in month_options if label == selected_label), None)
+    selected_sales_timestamp = next((ts for label, ts in sales_month_options if label == selected_sales_label), None)
 
-    if selected_timestamp is None:
-        st.warning("有効な月が選択されていません。")
+    if selected_sales_timestamp is None:
+        st.warning("有効な売上処理月が選択されていません。")
         return
         
-    st.info(f"選択された月: **{selected_label}** (UNIXタイムスタンプ: {selected_timestamp})")
+    st.info(f"選択された売上処理月: **{selected_sales_label}**")
     
-    st.header("2. データ取得とアップロードの実行")
-    
-    # 3. 実行ボタン
-    if st.button("🚀 タイムチャージ売上 / プレミアムライブ売上 / ルーム売上の全てを取得・FTPアップロードを実行", type="primary"):
-        with st.spinner(f"処理中: {selected_label}のデータを取得しています..."):
+    # --- 売上データ一括処理ボタン ---
+    if st.button("🚀 売上データ3種（タイムチャージ/プレミアムライブ/ルーム売上）を取得・FTPアップロードを実行", type="primary"):
+        with st.spinner(f"売上データ処理中: {selected_sales_label}のデータを取得しています..."):
             
-            # --- タイムチャージ売上処理 ---
-            process_data_type("time_charge", selected_timestamp, AUTH_COOKIE_STRING, FTP_CONFIG)
-            
-            # --- プレミアムライブ売上処理 ---
-            process_data_type("premium_live", selected_timestamp, AUTH_COOKIE_STRING, FTP_CONFIG)
-
-            # --- ルーム売上処理 --- (追加)
-            process_data_type("room_sales", selected_timestamp, AUTH_COOKIE_STRING, FTP_CONFIG)
+            process_sales_tool("time_charge", selected_sales_timestamp, AUTH_COOKIE_STRING, FTP_CONFIG)
+            process_sales_tool("premium_live", selected_sales_timestamp, AUTH_COOKIE_STRING, FTP_CONFIG)
+            process_sales_tool("room_sales", selected_sales_timestamp, AUTH_COOKIE_STRING, FTP_CONFIG)
 
         st.balloons()
-        st.success("🎉 **全ての処理が完了しました！**")
+        st.success("🎉 **売上データ3種の全ての処理が完了しました！**")
+        
+    st.markdown("---")
+
+    # 2. KPIデータ用の月選択 (2023年9月以降、マルチセレクト)
+    kpi_month_options = get_kpi_months()
+    kpi_month_labels = [label for label, _ in kpi_month_options]
+    
+    st.header("2. 配信KPIデータ処理対象月選択")
+    
+    selected_kpi_labels = st.multiselect(
+        "配信KPIデータ（2023年9月以降）の処理対象月を複数選択してください:",
+        options=kpi_month_labels,
+        default=kpi_month_labels[0] if kpi_month_labels else None # デフォルトで最新の月を選択
+    )
+    
+    # 選択されたラベルに対応する datetime オブジェクトのリストを生成
+    selected_kpi_dt_list = [dt for label, dt in kpi_month_options if label in selected_kpi_labels]
+
+    if selected_kpi_labels:
+        st.info(f"選択されたKPI処理月: **{', '.join(selected_kpi_labels)}**")
+    
+    # --- KPIデータ処理ボタン ---
+    if st.button("📊 配信KPIデータ を取得・FTPアップロードを実行", type="secondary"):
+        with st.spinner(f"KPIデータ処理中: 選択された月 ({len(selected_kpi_dt_list)}ヶ月) のKPIデータを取得しています..."):
+            
+            process_kpi_tool(selected_kpi_dt_list, AUTH_COOKIE_STRING, FTP_CONFIG)
+
+        st.balloons()
+        st.success("🎉 **配信KPIデータの処理が完了しました！**")
 
 
 if __name__ == "__main__":
