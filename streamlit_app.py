@@ -61,6 +61,7 @@ def get_target_months(years=2):
             
             try:
                 # 1. タイムゾーン情報のないdatetimeオブジェクトを生成
+                # 月の初日を設定
                 dt_naive = datetime(y, m, 1, 0, 0, 0)
                 
                 # 2. JSTでローカライズ
@@ -70,18 +71,6 @@ def get_target_months(years=2):
                 # 3. UNIXタイムスタンプ（UTC基準）に変換
                 timestamp = int(dt_obj_jst.timestamp()) 
                 
-                # --- ご指摘のあった正確な値の検証 ---
-                if y == 2025 and m == 10:
-                    expected_ts = 1759244400
-                    if timestamp != expected_ts:
-                         logging.error(f"FATAL: 2025年10月のTSが不一致: {timestamp}. 期待値: {expected_ts}")
-                
-                if y == 2025 and m == 9:
-                    expected_ts = 1756652400
-                    if timestamp != expected_ts:
-                         logging.error(f"FATAL: 2025年9月のTSが不一致: {timestamp}. 期待値: {expected_ts}")
-                # ==========================================
-
                 months.append((month_str, timestamp))
             except Exception as e:
                 logging.error(f"日付計算エラー ({month_str}): {e}")
@@ -130,14 +119,13 @@ def fetch_and_process_data(timestamp, cookie_string):
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
             'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
-            'Referer': SR_BASE_URL # Refererはあればより安全
+            'Referer': SR_BASE_URL
         }
         
         response = session.get(url, headers=headers, timeout=30)
         response.raise_for_status() # HTTPエラーが発生した場合に例外を発生させる
         
-        # 2. HTMLからのデータ抽出 (BeautifulSoup + html5libパーサーを使用)
-        # これによりlxmlのインストールエラーを完全に回避します
+        # 2. HTMLからのデータ抽出
         soup = BeautifulSoup(response.text, 'html5lib') 
         
         # 売上データが格納されているテーブルをクラス名で特定 (table-type-02)
@@ -154,20 +142,24 @@ def fetch_and_process_data(timestamp, cookie_string):
         table_data = []
         rows = table.find_all('tr')
         
-        # ヘッダー行をスキップし、データ行のみを処理
+        # ヘッダー行をスキップし、データ行のみを処理 (rows[1:]から開始)
         for row in rows[1:]: 
             td_tags = row.find_all('td')
             
-            # tdタグが5つある行のみを処理 (ルームID, ルームURL, ルーム名, 分配額, アカウントID)
-            if len(td_tags) == 5:
+            # --- 抽出ロジックの修正 ---
+            # 添付ファイルと同じ形式にするには、分配額とアカウントIDのみを取得する
+            # HTML構造: [0: ルームID, 1: ルームURL, 2: ルーム名, 3: 分配額, 4: アカウントID]
+            if len(td_tags) >= 5:
                 # 必要なデータ: 3番目のtd (分配額) と 4番目のtd (アカウントID)
-                amount = td_tags[3].text.strip().replace(',', '') # 分配額からカンマを除去
-                account_id = td_tags[4].text.strip() # アカウントID
+                # 分配額はカンマを除去
+                amount_str = td_tags[3].text.strip().replace(',', '') 
+                account_id = td_tags[4].text.strip()
                 
                 # 分配額が数値であることを確認（合計行などを除外）
-                if amount.isnumeric():
+                if amount_str.isnumeric():
                      table_data.append({
-                        '分配額': amount,
+                        # CSVの列順に合わせて名前を付ける
+                        '分配額': int(amount_str), # 数値に変換しておく
                         'アカウントID': account_id
                     })
         
@@ -179,19 +171,24 @@ def fetch_and_process_data(timestamp, cookie_string):
         df_cleaned = pd.DataFrame(table_data)
         st.success(f"テーブルデータ ({len(df_cleaned)}件) の抽出が完了しました。")
 
-        # 5. 特殊なヘッダー行の作成 (CSV形式に合わせる)
+        # 5. 特殊なCSV形式の作成（添付ファイルと同じ形式を再現）
         
         now_jst = datetime.now(JST)
         update_time_str = now_jst.strftime('%Y/%m/%d %H:%M')
         
+        # 添付ファイル形式: 
+        # 1行目: [更新日時] のみが3列目 (C列) に入る
+        # 2行目以降: [分配額], [アカウントID], [空] の3列
+        
+        # 1. ヘッダー行: [空], [空], [更新日時]
         # CSVのヘッダー行: [分配額, アカウントID, 更新日時(3列目のみ)]
         header_row = pd.DataFrame([['', '', update_time_str]], columns=['分配額', 'アカウントID', '更新日時'])
         
-        # データ行を再構成 (3列目を空に設定)
+        # 2. データ行: [分配額], [アカウントID], [空]
         df_data = pd.DataFrame({
             '分配額': df_cleaned['分配額'],
             'アカウントID': df_cleaned['アカウントID'],
-            '更新日時': '' 
+            '更新日時': '' # 常に空
         })
         
         # ヘッダー行とデータ行を結合
@@ -203,7 +200,7 @@ def fetch_and_process_data(timestamp, cookie_string):
         final_df.to_csv(csv_buffer, index=False, header=False, encoding='utf-8')
         
         st.success("データの整形が完了しました。")
-        st.code('\n'.join(csv_buffer.getvalue().split('\n')[:5]), language='text') # 整形後のCSVプレビュー
+        st.code('\n'.join(csv_buffer.getvalue().split('\n')[:len(final_df) + 1]), language='text') # 整形後のCSV全体をプレビュー
         
         return csv_buffer
         
