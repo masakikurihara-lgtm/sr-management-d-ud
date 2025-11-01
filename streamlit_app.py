@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO)
 
 # --- 定数設定 ---
 # 取得元の基本URL
-SR_BASE_URL = "https://www.showroom-live.com/organizer/show_rank_time_charge_hist_invoice_format" # 変数名を修正
+SR_BASE_URL = "https://www.showroom-live.com/organizer/show_rank_time_charge_hist_invoice_format" 
 # アップロード先ファイル名
 TARGET_FILENAME = "show_rank_time_charge_hist_invoice_format.csv"
 # 日本のタイムゾーン
@@ -25,6 +25,16 @@ def get_target_months(years=2):
     """過去N年間の月リストを 'YYYY年MM月分' 形式で生成する"""
     today = datetime.now(JST)
     months = []
+
+    # === デバッグ検証用（計算ロジックの確認） ===
+    # 2025年10月1日 00:00:00 JST -> 1759244400 (正しい値)
+    test_y, test_m = 2025, 10
+    dt_test = datetime(test_y, test_m, 1, 0, 0, 0, tzinfo=JST)
+    ts_test = int(dt_test.astimezone(pytz.utc).timestamp())
+    logging.info(f"DEBUG: 2025/10/01 00:00:00 JST (計算結果): {ts_test}. 期待値: 1759244400")
+    if ts_test != 1759244400:
+        logging.error("重大エラー: タイムスタンプの計算結果が期待値と一致しません。")
+    # ==========================================
     
     # 選択肢の表示を当月含む過去2年分程度に限定
     for y in range(today.year - years + 1, today.year + 1):
@@ -42,11 +52,8 @@ def get_target_months(years=2):
                 
                 # JSTのdatetimeオブジェクトをUTCに変換してからtimestampを取得することで、
                 # 正確にJSTの00:00:00を指すUNIXタイムスタンプを得る
+                # これが1759244400になるはずです。
                 timestamp = int(dt_obj_jst.astimezone(pytz.utc).timestamp())
-                
-                # 検証用：
-                # 2025年10月1日 00:00:00 JST -> 1759244400
-                # 2025年9月1日 00:00:00 JST -> 1756652400
                 
                 months.append((month_str, timestamp))
             except ValueError:
@@ -64,7 +71,7 @@ def fetch_and_process_data(timestamp, cookie_string):
     
     try:
         # 1. データ取得
-        # SR_BASE_URLを使用 (修正済み)
+        # SR_BASE_URLを使用
         url = f"{SR_BASE_URL}?from={timestamp}" 
         headers = {
             # 認証に必要なCookieを設定
