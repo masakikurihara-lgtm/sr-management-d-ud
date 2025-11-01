@@ -29,8 +29,9 @@ try:
         "host": st.secrets["ftp"]["host"],
         "user": st.secrets["ftp"]["user"],
         "password": st.secrets["ftp"]["password"],
-        # secretsで設定されたフルパスを使用することを推奨しますが、暫定的に決め打ち
-        "target_path": "/showroom/sales-app_v2/db/show_rank_time_charge_hist_invoice_format.csv" 
+        # FTPサーバー上の物理パスを設定。
+        # 成功実績のあるパス構造に合わせて、ホスト名をパスの起点に含めます。
+        "target_path": "/mksoul-pro.com/showroom/sales-app_v2/db/show_rank_time_charge_hist_invoice_format.csv" 
     }
 except KeyError as e:
     # secretsが存在しない場合はダミーを挿入してエラーを表示
@@ -43,244 +44,273 @@ except KeyError as e:
 # --- ユーティリティ関数 ---
 
 def get_target_months(years=2):
-    """過去N年間の月リストを 'YYYY年MM月分' 形式で生成し、正確なUNIXタイムスタンプを計算する"""
-    today = datetime.now(JST)
-    months = []
+    """過去指定年数分の年月 (YYYYMM) のリストを返す"""
+    today = datetime.now(JST).date()
+    target_months = []
     
-    # 選択肢の表示を当月含む過去2年分程度に限定
-    for y in range(today.year, today.year - years, -1): # 降順で年を処理
-        start_m = 12 if y < today.year else today.month
+    # 24ヶ月以上遡らないように上限を設定
+    max_months_to_check = years * 12 + 1 
+
+    for i in range(max_months_to_check):
+        # 現在の月から i ヶ月前の日付を計算
+        month_ago = today - timedelta(days=30 * i)
         
-        for m in range(start_m, 0, -1): # 月を降順で処理
-            
-            # 今後の月は除外 (ただし、既に過去の月しか見ていないため実質不要だが念のため)
-            if y == today.year and m > today.month:
-                continue 
-            
-            month_str = f"{y}年{m:02d}月分"
-            
-            try:
-                # 1. タイムゾーン情報のないdatetimeオブジェクトを生成
-                # 月の初日を設定
-                dt_naive = datetime(y, m, 1, 0, 0, 0)
-                
-                # 2. JSTでローカライズ
-                # is_dst=None を使用し、曖昧さの解決を強制し、安全なローカライズを保証
-                dt_obj_jst = JST.localize(dt_naive, is_dst=None)
-                
-                # 3. UNIXタイムスタンプ（UTC基準）に変換
-                timestamp = int(dt_obj_jst.timestamp()) 
-                
-                months.append((month_str, timestamp))
-            except Exception as e:
-                logging.error(f"日付計算エラー ({month_str}): {e}")
-                continue
-                
-    # 最新の月が上に来るようにする（既に降順になっているが念のため）
-    return months
-
-
-def create_authenticated_session(cookie_string):
-    """手動で取得したCookie文字列から認証済みRequestsセッションを構築する (参照コードと同じロジック)"""
-    st.info("認証セッションを構築します...")
-    session = requests.Session()
-    try:
-        cookies_dict = {}
-        for item in cookie_string.split(';'):
-            item = item.strip()
-            if '=' in item:
-                name, value = item.split('=', 1)
-                cookies_dict[name.strip()] = value.strip()
-        cookies_dict['i18n_redirected'] = 'ja'
-        session.cookies.update(cookies_dict)
+        # 取得対象の年月を YYYYMM 形式で格納
+        target_months.append(month_ago.strftime("%Y%m"))
         
-        if not cookies_dict:
-            st.error("🚨 有効な認証セッションを解析できませんでした。")
-            return None
-            
-        return session
-    except Exception as e:
-        st.error(f"認証セッションを解析中にエラーが発生しました: {e}")
-        return None
+        # 取得する年月のリストは重複を排除
+        target_months = sorted(list(set(target_months)), reverse=True)
+        
+        # 取得対象が指定された年数に達したら終了
+        if len(target_months) >= years * 12:
+             break
 
-def fetch_and_process_data(timestamp, cookie_string):
-    """
-    指定されたタイムスタンプに基づいてSHOWROOMからデータを取得し、BeautifulSoupで整形する
-    """
-    st.info(f"データ取得中... タイムスタンプ: {timestamp}")
-    session = create_authenticated_session(cookie_string)
-    if not session:
-        return None
+    # 常に最新の12か月*2年(24ヶ月)分を返す
+    return target_months[:years*12]
+
+
+@st.cache_data(ttl=600)
+def fetch_month_data(month_str, auth_cookie_string):
+    """特定の月 (YYYYMM) のデータをSHOWROOMのページから取得・解析する"""
+    # URLに年月 (YYYYMM) を含める
+    url = f"{SR_BASE_URL}?month={month_str}"
     
+    headers = {
+        "Cookie": auth_cookie_string,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+
     try:
-        # 1. データ取得
-        url = f"{SR_BASE_URL}?from={timestamp}" 
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
-            'Referer': SR_BASE_URL
-        }
-        
-        response = session.get(url, headers=headers, timeout=30)
-        response.raise_for_status() # HTTPエラーが発生した場合に例外を発生させる
-        
-        # 2. HTMLからのデータ抽出
-        soup = BeautifulSoup(response.text, 'html5lib') 
-        
-        # 売上データが格納されているテーブルをクラス名で特定 (table-type-02)
-        table = soup.find('table', class_='table-type-02') 
-        
-        if not table:
-            if "ログイン" in response.text or "会員登録" in response.text:
-                st.error("🚨 認証切れです。Cookieが古いか無効になっています。")
-                return None
-            st.error("HTMLから売上データテーブル (`table-type-02`) を検出できませんでした。ページ構造が変更されたか、データがまだ生成されていません。")
-            return None
-        
-        # 3. データをBeautifulSoupで抽出
-        table_data = []
-        rows = table.find_all('tr')
-        
-        # ヘッダー行をスキップし、データ行のみを処理 (rows[1:]から開始)
-        for row in rows[1:]: 
-            td_tags = row.find_all('td')
-            
-            # --- 抽出ロジックの修正 ---
-            # 添付ファイルと同じ形式にするには、分配額とアカウントIDのみを取得する
-            # HTML構造: [0: ルームID, 1: ルームURL, 2: ルーム名, 3: 分配額, 4: アカウントID]
-            if len(td_tags) >= 5:
-                # 必要なデータ: 3番目のtd (分配額) と 4番目のtd (アカウントID)
-                # 分配額はカンマを除去
-                amount_str = td_tags[3].text.strip().replace(',', '') 
-                account_id = td_tags[4].text.strip()
-                
-                # 分配額が数値であることを確認（合計行などを除外）
-                if amount_str.isnumeric():
-                     table_data.append({
-                        # CSVの列順に合わせて名前を付ける
-                        '分配額': int(amount_str), # 数値に変換しておく
-                        'アカウントID': account_id
-                    })
-        
-        if not table_data:
-            st.warning("⚠️ テーブルから有効なデータ行を抽出できませんでした。")
-            return None
-
-        # 4. DataFrameに変換し、整形
-        df_cleaned = pd.DataFrame(table_data)
-        st.success(f"テーブルデータ ({len(df_cleaned)}件) の抽出が完了しました。")
-
-        # 5. 特殊なCSV形式の作成（添付ファイルと同じ形式を再現）
-        
-        now_jst = datetime.now(JST)
-        update_time_str = now_jst.strftime('%Y/%m/%d %H:%M')
-        
-        # --- CSV形式の再修正ロジック ---
-        # 構造: [分配額], [アカウントID], [更新日時] の3列を全行使用する
-        # ただし、更新日時は1行目のみに記載し、2行目以降は空にする
-        
-        # 1. データを格納するための新しいDataFrameを準備
-        final_df = pd.DataFrame({
-            '分配額': df_cleaned['分配額'],
-            'アカウントID': df_cleaned['アカウントID'],
-            '更新日時': '' # デフォルトで空文字列
-        })
-        
-        # 2. 最初のデータ行（インデックス0）の「更新日時」列にのみ、現在時刻を設定
-        if not final_df.empty:
-            final_df.loc[0, '更新日時'] = update_time_str
-        
-        # CSVデータとして一時的にメモリに書き出す
-        csv_buffer = io.StringIO()
-        # UTF-8、ヘッダーなし、インデックスなし
-        final_df.to_csv(csv_buffer, index=False, header=False, encoding='utf-8')
-        
-        st.success("データの整形が完了しました。")
-        # プレビュー表示（ヘッダーなし、インデックスなしのCSV文字列全体）
-        st.code(csv_buffer.getvalue(), language='text') 
-        
-        return csv_buffer
-        
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()  # 200以外のステータスコードは例外を発生させる
     except requests.exceptions.HTTPError as e:
-        st.error(f"HTTPエラーが発生しました: {e.response.status_code}. 認証Cookieが無効になっている可能性があります。")
+        # 404 Not Found などのエラー処理
+        logging.error(f"HTTP Error for {month_str}: {e}")
         return None
-    except Exception as e:
-        st.error(f"予期せぬエラーが発生しました: {e}")
-        logging.error("データ取得・整形エラー", exc_info=True)
+    except requests.exceptions.RequestException as e:
+        # その他のリクエストエラー
+        logging.error(f"Request Error for {month_str}: {e}")
         return None
 
-def upload_file_ftp(csv_buffer, ftp_config):
-    """
-    FTPサーバーに整形済みCSVファイルをアップロードする
-    """
-    st.info(f"FTPサーバー ({ftp_config['host']}) に接続し、ファイルをアップロードします...")
+    # HTML解析
+    soup = BeautifulSoup(response.content, 'html.parser')
+
+    # テーブル要素を検索 (ここではIDやクラスではなく、構造で探す)
+    # 具体的なテーブル構造が不明なため、ここでは一旦ページ内の全てのテーブルを探す
+    tables = soup.find_all('table')
     
+    if not tables:
+        # データがない場合や、ログインしていない場合（テーブルが存在しない）
+        # ログイン画面にリダイレクトされているか確認 (今回はCookie認証なので不要な可能性あり)
+        logging.warning(f"No tables found for month {month_str}. Check login status or page structure.")
+        return None
+
+    # 適切なテーブルを特定する必要がある。今回は最初のテーブルを試す
     try:
-        csv_buffer.seek(0)
-        # FTP接続
-        with FTP(ftp_config['host'], ftp_config['user'], ftp_config['password']) as ftp:
-            # サーバーへアップロード
-            csv_bytes = csv_buffer.getvalue().encode('utf-8')
+        # PandasでHTMLからテーブルを直接読み込む
+        df_list = pd.read_html(response.text, header=0, encoding='utf-8')
+        # 複数のテーブルが見つかる可能性があるので、最もデータが多いテーブルを選ぶなど調整が必要だが、
+        # ここでは一旦、最も適切なテーブル（最初のテーブルなど）を試す
+        
+        # タイムチャージの請求書フォーマットは一つの主要なテーブルを持つと仮定し、
+        # カラム名でヘッダーが適切に検出されたものを探す
+        
+        target_df = None
+        for df in df_list:
+            # 必要なカラム名の一部 ('ルーム名', '時間帯', '時間(h)') などが含まれているかチェック
+            if any(col in df.columns for col in ['ルーム名', '時間帯', '時間(h)']) or len(df.columns) > 5:
+                target_df = df
+                break
+        
+        if target_df is None:
+            logging.warning(f"Could not find the target table in {month_str}.")
+            return None
+
+        # データフレームをクリーンアップ
+        return clean_data(target_df, month_str)
+
+    except ValueError as e:
+        # テーブルが見つからない、または解析できない場合
+        logging.warning(f"Failed to parse HTML tables for {month_str}: {e}")
+        return None
+
+
+def clean_data(df, month_str):
+    """取得したデータフレームを整形・クリーニングする"""
+    
+    # 1. 不要なフッター行の削除 (例: '合計'を含む行)
+    # NaNが多い行や、特定の集計行を削除する処理をここに追加
+    # カラムが標準化されていないため、今回はカラム数が多い行のみを対象とする
+    # 1行目（ヘッダー行）をスキップした後の行を対象とする
+    if '合計' in df.to_string():
+        df = df[~df.apply(lambda row: row.astype(str).str.contains('合計').any(), axis=1)]
+    
+    # NaNが多い（空の行）を削除
+    df.dropna(how='all', inplace=True)
+
+    # 2. カラム名の標準化 (SHOWROOMのページ構造に依存)
+    # ページを解析して、カラム名を特定し、標準化する
+    
+    # ページによってカラム名が変動する可能性があるため、確実な識別子を見つける
+    
+    # 暫定的なカラムマッピング（実際のデータに基づいて調整が必要）
+    column_mapping = {
+        'ルーム名': 'room_name',
+        '時間帯': 'time_slot',
+        '時間(h)': 'hours',
+        '日': 'day_of_month',
+        '種別': 'type' # 例: '通常' 'ボーナス'
+    }
+    
+    # 既に標準化された名前があればそのまま、そうでなければマッピングを使用
+    df.columns = [column_mapping.get(col, col) for col in df.columns]
+
+    # 3. 'day_of_month' カラムから日付を生成し、'date' カラムを追加
+    if 'day_of_month' in df.columns:
+        year = month_str[:4]
+        month = month_str[4:]
+        
+        # 日付が有効な数値であることを確認し、無効な行はスキップ
+        df['day_of_month'] = pd.to_numeric(df['day_of_month'], errors='coerce')
+        df.dropna(subset=['day_of_month'], inplace=True)
+        df['day_of_month'] = df['day_of_month'].astype(int)
+        
+        # 1〜月末日までの範囲内の日であることを確認
+        _, last_day = calendar.monthrange(int(year), int(month))
+        df = df[(df['day_of_month'] >= 1) & (df['day_of_month'] <= last_day)].copy()
+        
+        df['date_str'] = df.apply(
+            lambda row: f"{year}/{month}/{row['day_of_month']:02d}", 
+            axis=1
+        )
+        # JSTのdatetimeオブジェクトに変換
+        df['date'] = pd.to_datetime(df['date_str'], format='%Y/%m/%d').dt.tz_localize(JST)
+        df.drop(columns=['date_str', 'day_of_month'], inplace=True, errors='ignore')
+    
+    # 4. 'hours'を数値に変換 (エラーがあればNaN、その後削除)
+    if 'hours' in df.columns:
+        df['hours'] = pd.to_numeric(df['hours'], errors='coerce')
+        df.dropna(subset=['hours'], inplace=True)
+
+    # 5. 不要なカラムを削除（元のカラム名全てが不明なため、暫定的に必須項目以外は削除）
+    final_columns = ['date', 'room_name', 'time_slot', 'hours', 'type']
+    df = df[[col for col in final_columns if col in df.columns]].copy()
+    
+    # 6. 'month'カラムを追加 (集計用に)
+    df['month'] = month_str
+
+    logging.info(f"Cleaned data for {month_str}: {len(df)} rows")
+    return df
+
+
+def ftp_upload(target_path, data_bytes):
+    """指定されたデータをFTPでアップロードする"""
+    try:
+        logging.info(f"Connecting to FTP host: {FTP_CONFIG['host']}")
+        with FTP(FTP_CONFIG["host"]) as ftp:
+            ftp.login(user=FTP_CONFIG["user"], passwd=FTP_CONFIG["password"])
+            ftp.encoding = 'utf-8'
+
+            # StringIOではなくBytesIOを使用 (バイナリモード 'wb' のため)
+            bio = io.BytesIO(data_bytes)
             
-            # バイナリデータとしてアップロード
-            ftp.storbinary(f'STOR {ftp_config["target_path"]}', io.BytesIO(csv_bytes))
-            
-            st.success(f"✅ ファイルのアップロードが完了しました！")
-            st.markdown(f"**アップロード先:** `{ftp_config['host']}:{ftp_config['target_path']}`")
-            
+            # アップロード実行 (STOr file)
+            ftp.storbinary(f'STOR {target_path}', bio)
+            logging.info(f"Successfully uploaded to: {target_path}")
+            return True
+
     except Exception as e:
         st.error(f"FTPアップロード中にエラーが発生しました。設定（ホスト名、ユーザー、パスワード、パス）を確認してください: {e}")
-        logging.error("FTPエラー", exc_info=True)
+        logging.error(f"FTP Upload Error: {e}")
         return False
+
+
+def run_data_update():
+    """データ取得、整形、結合、FTPアップロードの一連の処理を実行する"""
+    
+    if not FTP_CONFIG:
+        st.error("FTP設定が正しくロードされていません。")
+        return
+
+    # 1. 取得対象の年月リストを生成
+    target_months = get_target_months(years=2) # 過去2年分
+    
+    st.info(f"⏳ 過去 {len(target_months)} ヶ月分のデータを取得します: {target_months[0]}〜{target_months[-1]}頃")
+    
+    all_data = []
+    status_bar = st.progress(0)
+    
+    # 2. 各月のデータを取得・整形
+    for i, month in enumerate(target_months):
+        st.caption(f"Fetching data for {month}...")
+        df = fetch_month_data(month, AUTH_COOKIE_STRING)
+        if df is not None and not df.empty:
+            all_data.append(df)
         
-    return True
+        status_bar.progress((i + 1) / len(target_months))
+
+    status_bar.empty()
+    
+    if not all_data:
+        st.error("😢 取得対象期間の有効なデータが見つかりませんでした。Cookieが有効か、期間内にデータが存在するか確認してください。")
+        return
+        
+    # 3. 全データを結合
+    final_df = pd.concat(all_data, ignore_index=True)
+    
+    # 4. 重複行の削除 (room_name, date, time_slot, typeが一致するものを最新のもののみ残す)
+    # 重複判定のカラム
+    # dateが最も重要なので、 date + room_name + time_slot + type が重複基準
+    subset_cols = ['date', 'room_name', 'time_slot', 'type']
+    final_df.sort_values(by='date', ascending=False, inplace=True) # 最新の日付を優先
+    
+    before_drop_count = len(final_df)
+    final_df.drop_duplicates(subset=subset_cols, keep='first', inplace=True)
+    after_drop_count = len(final_df)
+    
+    st.success(f"データ整形完了！合計 {after_drop_count} 件のレコードを統合しました。")
+    if before_drop_count != after_drop_count:
+        st.caption(f"({before_drop_count - after_drop_count} 件の古い重複データを除外しました。)")
+
+    # 5. CSVデータに変換
+    # タイムゾーン情報を除去して、YYYY-MM-DD HH:MM:SS形式の文字列として保存
+    final_df['date'] = final_df['date'].dt.tz_convert(None).dt.strftime('%Y-%m-%d %H:%M:%S')
+
+    csv_data = final_df.to_csv(index=False, encoding="utf-8-sig")
+    csv_bytes = csv_data.encode("utf-8-sig")
+
+    st.info(f"☁️ FTPサーバーへデータ ({TARGET_FILENAME}) をアップロード中...")
+    
+    # 6. FTPアップロード
+    if ftp_upload(FTP_CONFIG["target_path"], csv_bytes):
+        st.success("🎉 FTPアップロードが完了しました！")
+        
+        # 7. ダウンロードボタンを提供
+        st.download_button(
+            label="📥 統合されたCSVファイルをダウンロード",
+            data=csv_bytes,
+            file_name=f"showroom_time_charge_hist_{datetime.now(JST).strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv"
+        )
+    else:
+        st.error("FTPアップロードに失敗しました。設定とサーバーのパスを確認してください。")
+
 
 # --- Streamlit UI ---
 
-def main():
-    st.set_page_config(page_title="SHOWROOM売上データ アップロードツール", layout="wide")
-    st.title("ライバー売上データ 自動アップロードツール (タイムチャージ)")
-    st.markdown("---")
+st.set_page_config(page_title="SHOWROOMタイムチャージ履歴統合ツール", layout="centered")
 
-    # 2. 月選択プルダウンの作成
-    month_options = get_target_months()
-    month_labels = [label for label, _ in month_options]
-    
-    st.header("1. 対象月選択")
-    
-    selected_label = st.selectbox(
-        "処理対象の配信月を選択してください:",
-        options=month_labels,
-        index=0 # デフォルトで最新の月を選択
-    )
-    
-    selected_timestamp = next((ts for label, ts in month_options if label == selected_label), None)
+st.title("💰 SHOWROOM タイムチャージ履歴統合ツール")
+st.markdown("---")
 
-    if selected_timestamp is None:
-        st.warning("有効な月が選択されていません。")
-        return
-        
-    st.info(f"選択された月: **{selected_label}** (UNIXタイムスタンプ: {selected_timestamp})")
-    
-    st.header("2. データ取得とアップロードの実行")
-    
-    # 3. 実行ボタン
-    if st.button("🚀 データ取得・整形・FTPアップロードを実行", type="primary"):
-        with st.spinner(f"処理中: {selected_label}のデータを取得しています..."):
-            
-            # 1. データ取得と整形
-            csv_buffer = fetch_and_process_data(selected_timestamp, AUTH_COOKIE_STRING)
-            
-            if csv_buffer:
-                # 2. FTPアップロード
-                if FTP_CONFIG:
-                    upload_file_ftp(csv_buffer, FTP_CONFIG)
-                else:
-                    st.error("FTP設定が読み込まれていないため、アップロードはスキップされました。")
-            else:
-                st.error("データ取得・整形に失敗したため、アップロードはスキップされました。")
+st.markdown("""
+このツールは、SHOWROOMオーガナイザーページから過去2年分のタイムチャージ履歴データを取得・統合し、
+指定されたFTPサーバー上のCSVファイルを自動で更新します。
+""")
 
-if __name__ == "__main__":
-    # FTPライブラリのインポートはmainの外側に移動済み
-    main()
+if st.button("🚀 データ統合＆FTPアップロード実行"):
+    run_data_update()
+
+st.markdown("---")
+st.caption("※ 実行には、有効なSHOWROOMオーガナイザーのCookieとFTP接続情報が`.streamlit/secrets.toml`に設定されている必要があります。")
+st.caption(f"現在のFTPターゲットパス: `{FTP_CONFIG['target_path']}`")
