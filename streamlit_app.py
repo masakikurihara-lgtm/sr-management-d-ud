@@ -134,7 +134,6 @@ def create_authenticated_session(cookie_string):
 def fetch_and_process_data(timestamp, cookie_string, sr_url):
     """
     指定されたタイムスタンプに基づいてSHOWROOMからデータを取得し、BeautifulSoupで整形する
-    (関数名を変更し、引数にsr_urlを追加)
     """
     st.info(f"データ取得中... URL: {sr_url}, タイムスタンプ: {timestamp}")
     session = create_authenticated_session(cookie_string)
@@ -165,40 +164,49 @@ def fetch_and_process_data(timestamp, cookie_string, sr_url):
                 st.error("🚨 認証切れです。Cookieが古いか無効になっています。")
                 return None
             st.warning("HTMLから売上データテーブル (`table-type-02`) を検出できませんでした。ページ構造が変更されたか、データがまだ生成されていません。")
-            return None
+            # 認証切れではないが、テーブルが発見できない場合は、0件データとして処理を続行するために空のtable_dataのまま次へ進む
         
         # 3. データをBeautifulSoupで抽出
         table_data = []
-        rows = table.find_all('tr')
-        
-        # ヘッダー行をスキップし、データ行のみを処理 (rows[1:]から開始)
-        for row in rows[1:]: 
-            td_tags = row.find_all('td')
+        # tableがNoneでない場合にのみ行を抽出
+        if table:
+            rows = table.find_all('tr')
             
-            # --- 抽出ロジック（タイムチャージ/プレミアムライブで共通） ---
-            # HTML構造: [0: ルームID, 1: ルームURL, 2: ルーム名, 3: 分配額, 4: アカウントID]
-            if len(td_tags) >= 5:
-                # 必要なデータ: 3番目のtd (分配額) と 4番目のtd (アカウントID)
-                # 分配額はカンマを除去
-                amount_str = td_tags[3].text.strip().replace(',', '') 
-                account_id = td_tags[4].text.strip()
+            # ヘッダー行をスキップし、データ行のみを処理 (rows[1:]から開始)
+            for row in rows[1:]: 
+                td_tags = row.find_all('td')
                 
-                # 分配額が数値であることを確認（合計行などを除外）
-                if amount_str.isnumeric():
-                     table_data.append({
-                        # CSVの列順に合わせて名前を付ける
-                        '分配額': int(amount_str), # 数値に変換しておく
-                        'アカウントID': account_id
-                    })
+                # --- 抽出ロジック（タイムチャージ/プレミアムライブで共通） ---
+                # HTML構造: [0: ルームID, 1: ルームURL, 2: ルーム名, 3: 分配額, 4: アカウントID]
+                if len(td_tags) >= 5:
+                    # 必要なデータ: 3番目のtd (分配額) と 4番目のtd (アカウントID)
+                    # 分配額はカンマを除去
+                    amount_str = td_tags[3].text.strip().replace(',', '') 
+                    account_id = td_tags[4].text.strip()
+                    
+                    # 分配額が数値であることを確認（合計行などを除外）
+                    if amount_str.isnumeric():
+                         table_data.append({
+                            # CSVの列順に合わせて名前を付ける
+                            '分配額': amount_str, 
+                            'アカウントID': account_id
+                        })
+        
+        # 4. DataFrameに変換し、整形 (修正ロジック: 0件でも指定されたダミーデータを含む1行データを作る)
         
         if not table_data:
-            st.warning("⚠️ テーブルから有効なデータ行を抽出できませんでした。")
-            return None
-
-        # 4. DataFrameに変換し、整形
-        df_cleaned = pd.DataFrame(table_data)
-        st.success(f"テーブルデータ ({len(df_cleaned)}件) の抽出が完了しました。")
-
+            st.warning("⚠️ テーブルから有効なデータ行を抽出できませんでした。分配額=0、アカウントID=dummyを含む1行データとして処理を続行します。")
+            
+            # ゼロ件データ用のDataFrameを作成。分配額=0、アカウントID=dummyを設定
+            df_cleaned = pd.DataFrame([{
+                '分配額': '0',       # 分配額: 0 (文字列)
+                'アカウントID': 'dummy' # アカウントID: dummy
+            }])
+            
+        else:
+            st.success(f"テーブルデータ ({len(table_data)}件) の抽出が完了しました。")
+            df_cleaned = pd.DataFrame(table_data)
+        
         # 5. 特殊なCSV形式の作成（添付ファイルと同じ形式を再現）
         
         now_jst = datetime.now(JST)
@@ -209,6 +217,7 @@ def fetch_and_process_data(timestamp, cookie_string, sr_url):
         # 更新日時は1行目のみに記載し、2行目以降は空にする
         
         # 1. データを格納するための新しいDataFrameを準備
+        # df_cleanedは、データ件数N > 0 の場合は N行、0件の場合は 1行を持つ
         final_df = pd.DataFrame({
             '分配額': df_cleaned['分配額'],
             'アカウントID': df_cleaned['アカウントID'],
@@ -240,7 +249,7 @@ def fetch_and_process_data(timestamp, cookie_string, sr_url):
 
 def upload_file_ftp(csv_buffer, ftp_config, full_target_path):
     """
-    FTPサーバーに整形済みCSVファイルをアップロードする (引数にfull_target_pathを追加)
+    FTPサーバーに整形済みCSVファイルをアップロードする 
     """
     st.info(f"FTPサーバー ({ftp_config['host']}) に接続し、ファイルをアップロードします... (パス: {full_target_path})")
     
@@ -281,6 +290,7 @@ def process_data_type(data_type_key, selected_timestamp, auth_cookie_string, ftp
     # 1. データ取得と整形
     csv_buffer = fetch_and_process_data(selected_timestamp, auth_cookie_string, sr_url)
     
+    # 0件データでもcsv_bufferは生成されるようになったため、ここではNoneチェックのみ
     if csv_buffer:
         # 2. FTPアップロード
         if ftp_config:
@@ -288,6 +298,7 @@ def process_data_type(data_type_key, selected_timestamp, auth_cookie_string, ftp
         else:
             st.error("FTP設定が読み込まれていないため、アップロードはスキップされました。")
     else:
+        # fetch_and_process_dataがエラーなどでNoneを返した場合のみ実行される
         st.error(f"{data_label}のデータ取得・整形に失敗したため、アップロードはスキップされました。")
         
     st.markdown("---")
