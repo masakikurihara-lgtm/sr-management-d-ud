@@ -338,6 +338,16 @@ def fetch_and_process_kpi_data(month_dt: datetime, cookie_string: str) -> pd.Dat
     session = create_authenticated_session(cookie_string)
     if not session:
         return None
+        
+    # 🚨 認証強化のための修正 🚨
+    # KPIページはパラメータ付きリクエストの前に、ベースURLへのアクセスが必要な場合があるため、セッションを確立させる
+    try:
+        st.info("KPIベースURLにアクセスし、セッション確立を試みます...")
+        session.get(SR_KPI_URL, timeout=10)
+    except Exception as e:
+        # 警告ログを出しつつ続行。セッション自体はクッキーで認証されているため。
+        st.warning(f"KPIベースURLアクセスで警告が発生しましたが続行します: {e}")
+    # 🚨 修正ここまで 
     
     all_kpi_data: List[Dict[str, Any]] = []
     
