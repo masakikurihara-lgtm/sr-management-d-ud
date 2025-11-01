@@ -17,6 +17,8 @@ logging.basicConfig(level=logging.INFO)
 SR_TIME_CHARGE_URL = "https://www.showroom-live.com/organizer/show_rank_time_charge_hist_invoice_format" 
 # プレミアムライブ請求書ページのURL (追加)
 SR_PREMIUM_LIVE_URL = "https://www.showroom-live.com/organizer/paid_live_hist_invoice_format" 
+# ルーム売上請求書ページのURL (追加)
+SR_ROOM_SALES_URL = "https://www.showroom-live.com/organizer/point_hist_with_mixed_rate" 
 
 # 処理するデータの種類とそれに対応するURL、ファイル名
 DATA_TYPES = {
@@ -24,13 +26,22 @@ DATA_TYPES = {
         "label": "タイムチャージ売上",
         "url": SR_TIME_CHARGE_URL,
         # FTPパスの末尾に使用するファイル名部分
-        "filename": "show_rank_time_charge_hist_invoice_format.csv" 
+        "filename": "show_rank_time_charge_hist_invoice_format.csv",
+        "type": "standard" 
     },
     "premium_live": {
         "label": "プレミアムライブ売上",
         "url": SR_PREMIUM_LIVE_URL,
         # FTPパスの末尾に使用するファイル名部分
-        "filename": "paid_live_hist_invoice_format.csv" 
+        "filename": "paid_live_hist_invoice_format.csv",
+        "type": "standard"
+    },
+    "room_sales": { # ルーム売上を追加
+        "label": "ルーム売上",
+        "url": SR_ROOM_SALES_URL,
+        # FTPパスの末尾に使用するファイル名部分
+        "filename": "point_hist_with_mixed_rate_csv_donwload_for_room.csv",
+        "type": "room_sales"
     }
 }
 
@@ -131,9 +142,10 @@ def create_authenticated_session(cookie_string):
         st.error(f"認証セッションを解析中にエラーが発生しました: {e}")
         return None
 
-def fetch_and_process_data(timestamp, cookie_string, sr_url):
+def fetch_and_process_data(timestamp, cookie_string, sr_url, data_type_key):
     """
     指定されたタイムスタンプに基づいてSHOWROOMからデータを取得し、BeautifulSoupで整形する
+    (引数に data_type_key を追加)
     """
     st.info(f"データ取得中... URL: {sr_url}, タイムスタンプ: {timestamp}")
     session = create_authenticated_session(cookie_string)
@@ -166,7 +178,7 @@ def fetch_and_process_data(timestamp, cookie_string, sr_url):
             st.warning("HTMLから売上データテーブル (`table-type-02`) を検出できませんでした。ページ構造が変更されたか、データがまだ生成されていません。")
             # 認証切れではないが、テーブルが発見できない場合は、0件データとして処理を続行するために空のtable_dataのまま次へ進む
         
-        # 3. データをBeautifulSoupで抽出
+        # 3. データをBeautifulSoupで抽出 (ライバー個別のデータ)
         table_data = []
         # tableがNoneでない場合にのみ行を抽出
         if table:
@@ -176,7 +188,7 @@ def fetch_and_process_data(timestamp, cookie_string, sr_url):
             for row in rows[1:]: 
                 td_tags = row.find_all('td')
                 
-                # --- 抽出ロジック（タイムチャージ/プレミアムライブで共通） ---
+                # --- 抽出ロジック（タイムチャージ/プレミアムライブ/ルーム売上で共通） ---
                 # HTML構造: [0: ルームID, 1: ルームURL, 2: ルーム名, 3: 分配額, 4: アカウントID]
                 if len(td_tags) >= 5:
                     # 必要なデータ: 3番目のtd (分配額) と 4番目のtd (アカウントID)
@@ -192,22 +204,64 @@ def fetch_and_process_data(timestamp, cookie_string, sr_url):
                             'アカウントID': account_id
                         })
         
-        # 4. DataFrameに変換し、整形 (修正ロジック: 0件でも指定されたダミーデータを含む1行データを作る)
+        # 4. DataFrameに変換し、整形 (ロジックの分岐)
         
-        if not table_data:
-            st.warning("⚠️ テーブルから有効なデータ行を抽出できませんでした。分配額=0、アカウントID=dummyを含む1行データとして処理を続行します。")
+        # 4-A. ルーム売上の特殊ロジック
+        if data_type_key == "room_sales":
             
-            # ゼロ件データ用のDataFrameを作成。分配額=0、アカウントID=dummyを設定
-            df_cleaned = pd.DataFrame([{
-                '分配額': '0',       # 分配額: 0 (文字列)
-                'アカウントID': 'dummy' # アカウントID: dummy
-            }])
+            # 1. 支払い金額（税抜）の抽出 (1行目1列目の値)
+            total_amount_tag = soup.find('p', class_='fs-b4 bg-light-gray p-b3 mb-b2 link-light-green')
+            total_amount_str = '0' # デフォルト値を '0' に設定
+            if total_amount_tag:
+                # <span>タグを検索して、支払い金額（税抜）を抽出
+                # '支払い金額（税抜）: <span class="fw-b"> 1,182,445円</span><br>'
+                import re
+                
+                # 支払い金額（税抜）の行を抽出
+                match = re.search(r'支払い金額（税抜）:\s*<span[^>]*>\s*([\d,]+)円', str(total_amount_tag))
+                
+                if match:
+                    # カンマと '円' を除去
+                    total_amount_str = match.group(1).replace(',', '') 
+                else:
+                    st.warning("⚠️ HTMLから「支払い金額（税抜）」の値を抽出できませんでした。分配額を「0」として処理を続行します。")
+                    
+            # 2. 1行目のヘッダーデータを作成 (合計値 + MKsoul)
+            header_data = [{
+                '分配額': total_amount_str,
+                'アカウントID': 'MKsoul'
+            }]
             
-        else:
-            st.success(f"テーブルデータ ({len(table_data)}件) の抽出が完了しました。")
-            df_cleaned = pd.DataFrame(table_data)
-        
-        # 5. 特殊なCSV形式の作成（添付ファイルと同じ形式を再現）
+            # 3. ライバー個別のデータと結合
+            header_df = pd.DataFrame(header_data)
+            
+            if table_data:
+                # ライバーデータが存在する場合、header_dfの後ろに連結
+                driver_df = pd.DataFrame(table_data)
+                df_cleaned = pd.concat([header_df, driver_df], ignore_index=True)
+                st.success(f"テーブルデータ ({len(driver_df)}件) の抽出と合計値 ({total_amount_str}) の設定が完了しました。")
+            else:
+                # ライバーデータが存在しない場合、header_df（1行）のみ
+                df_cleaned = header_df
+                st.warning(f"⚠️ ライバー個別のデータ行を抽出できませんでした。合計値 ({total_amount_str}) と MKsoul のみを含む1行データとして処理を続行します。")
+
+
+        # 4-B. タイムチャージ/プレミアムライブの既存ロジック (0件時のダミーデータ生成)
+        else: # time_charge or premium_live
+            if not table_data:
+                st.warning("⚠️ テーブルから有効なデータ行を抽出できませんでした。分配額=0、アカウントID=dummyを含む1行データとして処理を続行します。")
+                
+                # ゼロ件データ用のDataFrameを作成。分配額=0、アカウントID=dummyを設定
+                df_cleaned = pd.DataFrame([{
+                    '分配額': '0',       # 分配額: 0 (文字列)
+                    'アカウントID': 'dummy' # アカウントID: dummy
+                }])
+                
+            else:
+                st.success(f"テーブルデータ ({len(table_data)}件) の抽出が完了しました。")
+                df_cleaned = pd.DataFrame(table_data)
+
+        # 5. 特殊なCSV形式の作成（共通ロジック）
         
         now_jst = datetime.now(JST)
         update_time_str = now_jst.strftime('%Y/%m/%d %H:%M')
@@ -217,7 +271,6 @@ def fetch_and_process_data(timestamp, cookie_string, sr_url):
         # 更新日時は1行目のみに記載し、2行目以降は空にする
         
         # 1. データを格納するための新しいDataFrameを準備
-        # df_cleanedは、データ件数N > 0 の場合は N行、0件の場合は 1行を持つ
         final_df = pd.DataFrame({
             '分配額': df_cleaned['分配額'],
             'アカウントID': df_cleaned['アカウントID'],
@@ -275,7 +328,7 @@ def upload_file_ftp(csv_buffer, ftp_config, full_target_path):
 
 def process_data_type(data_type_key, selected_timestamp, auth_cookie_string, ftp_config):
     """
-    指定されたデータタイプ（タイムチャージまたはプレミアムライブ）の処理を実行する
+    指定されたデータタイプ（タイムチャージ、プレミアムライブ、またはルーム売上）の処理を実行する
     """
     data_info = DATA_TYPES[data_type_key]
     data_label = data_info["label"]
@@ -287,10 +340,9 @@ def process_data_type(data_type_key, selected_timestamp, auth_cookie_string, ftp
     
     st.subheader(f"🔄 **{data_label}** の処理を開始します")
     
-    # 1. データ取得と整形
-    csv_buffer = fetch_and_process_data(selected_timestamp, auth_cookie_string, sr_url)
+    # 1. データ取得と整形 (data_type_keyを渡す)
+    csv_buffer = fetch_and_process_data(selected_timestamp, auth_cookie_string, sr_url, data_type_key)
     
-    # 0件データでもcsv_bufferは生成されるようになったため、ここではNoneチェックのみ
     if csv_buffer:
         # 2. FTPアップロード
         if ftp_config:
@@ -307,7 +359,7 @@ def process_data_type(data_type_key, selected_timestamp, auth_cookie_string, ftp
 
 def main():
     st.set_page_config(page_title="SHOWROOM売上データ アップロードツール", layout="wide")
-    st.title("ライバー売上データ 自動アップロードツール (タイムチャージ / プレミアムライブ)")
+    st.title("ライバー売上データ 自動アップロードツール (タイムチャージ / プレミアムライブ / ルーム売上)")
     st.markdown("---")
 
     # 2. 月選択プルダウンの作成
@@ -333,7 +385,7 @@ def main():
     st.header("2. データ取得とアップロードの実行")
     
     # 3. 実行ボタン
-    if st.button("🚀 タイムチャージ売上 / プレミアムライブ売上の両方を取得・FTPアップロードを実行", type="primary"):
+    if st.button("🚀 タイムチャージ売上 / プレミアムライブ売上 / ルーム売上の全てを取得・FTPアップロードを実行", type="primary"):
         with st.spinner(f"処理中: {selected_label}のデータを取得しています..."):
             
             # --- タイムチャージ売上処理 ---
@@ -341,6 +393,9 @@ def main():
             
             # --- プレミアムライブ売上処理 ---
             process_data_type("premium_live", selected_timestamp, AUTH_COOKIE_STRING, FTP_CONFIG)
+
+            # --- ルーム売上処理 --- (追加)
+            process_data_type("room_sales", selected_timestamp, AUTH_COOKIE_STRING, FTP_CONFIG)
 
         st.balloons()
         st.success("🎉 **全ての処理が完了しました！**")
