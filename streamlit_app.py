@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO)
 
 # --- 定数設定 ---
 # 取得元の基本URL
-SR_BASE_URL = "https://www.showroom-live.com/organizer/show_rank_time_charge_hist_invoice_format"
+SR_BASE_BASE_URL = "https://www.showroom-live.com/organizer/show_rank_time_charge_hist_invoice_format"
 # アップロード先ファイル名
 TARGET_FILENAME = "show_rank_time_charge_hist_invoice_format.csv"
 # 日本のタイムゾーン
@@ -37,9 +37,16 @@ def get_target_months(years=2):
             
             # データ取得のfromパラメータに必要な、対象月の1日00:00:00 JSTのUNIXタイムスタンプを計算
             try:
-                # 対象月の1日 JST
-                dt_obj = datetime(y, m, 1, 0, 0, 0, tzinfo=JST)
-                timestamp = int(dt_obj.timestamp())
+                # 対象月の1日 00:00:00 JST
+                dt_obj_jst = datetime(y, m, 1, 0, 0, 0, tzinfo=JST)
+                
+                # JSTのdatetimeオブジェクトをUTCに変換してからtimestampを取得することで、
+                # 正確にJSTの00:00:00を指すUNIXタイムスタンプを得る
+                timestamp = int(dt_obj_jst.astimezone(pytz.utc).timestamp())
+                
+                # 検証用：2025年10月1日 00:00:00 JST -> 1759244400 になることを確認
+                # st.write(f"{month_str}: {timestamp}")
+                
                 months.append((month_str, timestamp))
             except ValueError:
                 # 存在しない月（例: 2月30日など）はスキップ
