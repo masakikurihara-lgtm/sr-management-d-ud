@@ -2,3 +2,5 @@ streamlit
 requests
 pandas
 pytz
+lxml
+ftplib
