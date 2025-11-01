@@ -48,21 +48,20 @@ DATA_TYPES = {
 # --- KPIデータ設定 ---
 SR_KPI_URL = "https://www.showroom-live.com/organizer/live_kpi"
 KPI_MAX_PAGES = 5
-# KPIデータの保存先ディレクトリ（売上データとは異なる絶対パスを定義）
+# KPIデータの保存先ディレクトリ
 KPI_FTP_BASE_PATH = "/mksoul-pro.com/showroom/csv/"
 
 
-# --- 設定ロードと認証 (修正) ---
+# --- 設定ロードと認証 ---
 try:
     # 既存の共通Cookie（売上3点セット用）
     AUTH_COOKIE_STRING = st.secrets["showroom"]["auth_cookie_string"]
     
-    # 🚨 修正: KPI専用Cookieの読み込みを試みる
+    # KPI専用Cookieの読み込みを試みる
     try:
         KPI_AUTH_COOKIE_STRING = st.secrets["showroom"]["kpi_auth_cookie_string"]
         st.info("KPI専用のCookieが設定されました。KPI処理ではこのCookieを使用します。")
     except KeyError:
-        # KPI専用Cookieがsecretsにない場合は、共通Cookieをフォールバックとして使用
         KPI_AUTH_COOKIE_STRING = AUTH_COOKIE_STRING
         st.warning("KPI専用Cookie (`kpi_auth_cookie_string`) が見つかりません。共通CookieをKPI処理に使用します。")
 
@@ -97,7 +96,7 @@ except KeyError as e:
 def get_sales_months():
     """売上データ用: 2023年10月以降の月リストを 'YYYY年MM月分' 形式で生成し、UNIXタイムスタンプを計算する"""
     START_YEAR = 2023
-    START_MONTH = 10 # 売上データは10月開始
+    START_MONTH = 10 
     
     today = datetime.now(JST)
     months = []
@@ -132,7 +131,7 @@ def get_sales_months():
 def get_kpi_months():
     """KPIデータ用: 2023年9月以降の月リストを 'YYYY年MM月分' 形式で生成し、datetimeオブジェクトを計算する"""
     START_YEAR = 2023
-    START_MONTH = 9 # KPIデータは9月開始
+    START_MONTH = 9 
     
     today = datetime.now(JST)
     months = []
@@ -331,7 +330,7 @@ def fetch_and_process_sales_data(timestamp, cookie_string, sr_url, data_type_key
         return None
 
 
-# --- KPIデータ処理ロジック (新規) ---
+# --- KPIデータ処理ロジック (認証強化版) ---
 
 def fetch_and_process_kpi_data(month_dt: datetime, cookie_string: str) -> pd.DataFrame or None:
     """
@@ -340,13 +339,35 @@ def fetch_and_process_kpi_data(month_dt: datetime, cookie_string: str) -> pd.Dat
     
     from_date_str, to_date_str, file_prefix = get_month_start_end_dates(month_dt)
     st.info(f"KPIデータ取得期間: {from_date_str} から {to_date_str} まで (最大 {KPI_MAX_PAGES} ページ)")
-    # process_kpi_toolから渡された専用(またはフォールバック)のcookie_stringを使用
     session = create_authenticated_session(cookie_string) 
     if not session:
         return None
         
-    # 前回試行したセッションウォームアップ処理は削除し、新Cookieでの認証に集中します。
-    
+    # 1. ベースページにアクセスし、CSRFトークンなどのセッション情報を取得
+    csrf_token = None
+    try:
+        st.info("KPIベースURLにアクセスし、CSRFトークンを抽出します...")
+        base_response = session.get(SR_KPI_URL, timeout=15)
+        base_response.raise_for_status()
+        
+        if "ログイン" in base_response.text:
+            st.error("🚨 ベースURLアクセス時に認証切れが検出されました。Cookieを再取得してください。")
+            return None
+            
+        base_soup = BeautifulSoup(base_response.text, 'html5lib')
+        
+        # CSRFトークンをメタタグから探す (一般的に使われる方式)
+        csrf_meta = base_soup.find('meta', attrs={'name': 'csrf-token'})
+        if csrf_meta and 'content' in csrf_meta.attrs:
+            csrf_token = csrf_meta['content']
+            st.info(f"CSRFトークンをメタタグから抽出しました。")
+        else:
+            st.warning("CSRFトークンは検出されませんでした。トークンなしでAJAXリクエストを試行します。")
+            
+    except requests.exceptions.RequestException as e:
+        st.error(f"KPIベースURLアクセスでエラーが発生しました: {e}。データ取得を中止します。")
+        return None
+        
     all_kpi_data: List[Dict[str, Any]] = []
     
     CSV_HEADERS = [
@@ -357,20 +378,26 @@ def fetch_and_process_kpi_data(month_dt: datetime, cookie_string: str) -> pd.Dat
         "ギフト数", "ギフト人数", "初ギフト人数", "期限あり/期限なしSGのギフティング数", 
         "期限あり/期限なしSGのギフティング人数", "期限あり/期限なしSG総額", "2023年9月以前のおまけ分(無償SG RS外)"
     ]
-    
+
     # ページネーションループ
     for page_num in range(1, KPI_MAX_PAGES + 1):
         try:
             url = (f"{SR_KPI_URL}?page={page_num}&room_id=&from_date={from_date_str}&to_date={to_date_str}")
-            st.info(f"➡️ ページ {page_num} を取得中...")
+            st.info(f"➡️ ページ {page_num} を取得中... (AJAXシミュレーション)")
             
+            # 2. AJAXリクエストヘッダーの設定
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
                 'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
-                'Referer': SR_KPI_URL
+                'Referer': SR_KPI_URL,
+                'X-Requested-With': 'XMLHttpRequest' # 🚨 AJAXリクエストであることを通知するヘッダー
             }
             
+            # CSRFトークンが存在すれば、ヘッダーに追加する
+            if csrf_token:
+                 headers['X-CSRF-TOKEN'] = csrf_token 
+                 
             response = session.get(url, headers=headers, timeout=30)
             response.raise_for_status() 
             
@@ -379,6 +406,7 @@ def fetch_and_process_kpi_data(month_dt: datetime, cookie_string: str) -> pd.Dat
             
             if not table:
                 if "ログイン" in response.text:
+                    # 認証切れの場合はここでエラー終了
                     st.error("🚨 認証切れです。Cookieが古いか無効になっています。")
                     return None
                 st.warning(f"ページ {page_num}: データテーブルを検出できませんでした。データが終了したか、ページ構造が変更されています。")
@@ -462,7 +490,7 @@ def fetch_and_process_kpi_data(month_dt: datetime, cookie_string: str) -> pd.Dat
     
     df = pd.DataFrame(all_kpi_data, columns=CSV_HEADERS)
     
-    # 重複除外 (重複除外キーはアカウントID, ルームID, 配信日時, 配信時間(分))
+    # 重複除外
     dedup_keys = ["アカウントID", "ルームID", "配信日時", "配信時間(分)"]
     original_count = len(df)
     df_cleaned = df.drop_duplicates(subset=dedup_keys, keep='first')
@@ -477,8 +505,8 @@ def fetch_and_process_kpi_data(month_dt: datetime, cookie_string: str) -> pd.Dat
 
 
 # --- FTPアップロード関数 ---
+
 def upload_file_ftp(csv_buffer, ftp_config, full_target_path):
-    # ... (変更なし) ...
     """
     FTPサーバーに整形済みCSVファイルをアップロードする 
     """
@@ -506,7 +534,6 @@ def upload_file_ftp(csv_buffer, ftp_config, full_target_path):
 # --- ラッパー関数 ---
 
 def process_sales_tool(data_type_key, selected_timestamp, auth_cookie_string, ftp_config):
-    # ... (変更なし) ...
     """
     売上データタイプ（タイムチャージ、プレミアムライブ、またはルーム売上）の処理を実行する
     """
@@ -532,7 +559,6 @@ def process_sales_tool(data_type_key, selected_timestamp, auth_cookie_string, ft
     st.markdown("---")
 
 def process_kpi_tool(selected_month_dt_list: List[datetime], auth_cookie_string: str, ftp_config: Dict[str, str]):
-    # ... (引数のauth_cookie_stringにはKPI_AUTH_COOKIE_STRINGが渡される) ...
     """
     KPIデータ取得・整形・アップロードの処理を複数月に対して実行する
     """
@@ -555,7 +581,7 @@ def process_kpi_tool(selected_month_dt_list: List[datetime], auth_cookie_string:
         full_target_path = KPI_FTP_BASE_PATH + target_filename
         
         # 1. データ取得と整形（DataFrameを返す）
-        df_cleaned = fetch_and_process_kpi_data(month_dt, auth_cookie_string) # 渡されたCookieを使用
+        df_cleaned = fetch_and_process_kpi_data(month_dt, auth_cookie_string)
         
         if df_cleaned is not None:
             
@@ -577,7 +603,7 @@ def process_kpi_tool(selected_month_dt_list: List[datetime], auth_cookie_string:
         st.markdown("---")
 
 
-# --- Streamlit UI (修正) ---
+# --- Streamlit UI ---
 
 def main():
     st.set_page_config(page_title="SHOWROOMデータ アップロードツール", layout="wide")
@@ -642,7 +668,7 @@ def main():
     if st.button("📊 配信KPIデータ を取得・FTPアップロードを実行", type="secondary"):
         with st.spinner(f"KPIデータ処理中: 選択された月 ({len(selected_kpi_dt_list)}ヶ月) のKPIデータを取得しています..."):
             
-            # 🚨 修正: KPI専用Cookie (KPI_AUTH_COOKIE_STRING) を使用
+            # KPI専用Cookie (KPI_AUTH_COOKIE_STRING) を使用
             process_kpi_tool(selected_kpi_dt_list, KPI_AUTH_COOKIE_STRING, FTP_CONFIG)
 
         st.balloons()
