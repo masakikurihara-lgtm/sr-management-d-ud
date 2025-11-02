@@ -365,8 +365,12 @@ def process_data_type(data_type_key, selected_timestamp, auth_cookie_string, ftp
 # --- Streamlit UI ---
 
 def main():
-    st.set_page_config(page_title="SHOWROOM売上データ アップロードツール", layout="wide")
-    st.title("ライバー売上データ 自動アップロードツール (タイムチャージ / プレミアムライブ / ルーム売上)")
+    st.set_page_config(page_title="SHOWROOM ライバー売上データアップロード", layout="wide")
+    #st.title("ライバー売上データ 自動アップロードツール (タイムチャージ / プレミアムライブ / ルーム売上)")
+    st.markdown(
+        "<h1 style='font-size:28px; text-align:left; color:#1f2937;'>SHOWROOM ライバー売上データアップロード</h1>",
+        unsafe_allow_html=True
+    )
     st.markdown("---")
 
     # 2. 月選択プルダウンの作成
