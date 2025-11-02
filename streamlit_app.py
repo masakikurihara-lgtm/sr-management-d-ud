@@ -399,7 +399,8 @@ def main():
     st.markdown("#### 2. データ取得とアップロードの実行")
     
     # 3. 実行ボタン
-    if st.button("🚀 タイムチャージ売上 / プレミアムライブ売上 / ルーム売上の全てを取得・FTPアップロードを実行", type="primary"):
+    #if st.button("🚀 タイムチャージ売上 / プレミアムライブ売上 / ルーム売上の全てを取得・FTPアップロードを実行", type="primary"):
+    if st.button("🚀 ルーム売上 / タイムチャージ売上 / プレミアムライブ売上の全てを取得・FTPアップロードを実行", type="primary"):
         with st.spinner(f"処理中: {selected_label}のデータを取得しています..."):
             
             # --- ルーム売上処理 ---
