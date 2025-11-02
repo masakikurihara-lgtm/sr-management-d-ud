@@ -26,21 +26,21 @@ DATA_TYPES = {
     "time_charge": {
         "label": "タイムチャージ売上",
         "url": SR_TIME_CHARGE_URL,
-        # FTPパスの末尾に使用するファイル名部分
+        # FTPパスの末尾に使用するファイル名部分 (ベース名)
         "filename": "show_rank_time_charge_hist_invoice_format.csv",
         "type": "standard" 
     },
     "premium_live": {
         "label": "プレミアムライブ売上",
         "url": SR_PREMIUM_LIVE_URL,
-        # FTPパスの末尾に使用するファイル名部分
+        # FTPパスの末尾に使用するファイル名部分 (ベース名)
         "filename": "paid_live_hist_invoice_format.csv",
         "type": "standard"
     },
     "room_sales": { # ルーム売上を追加
         "label": "ルーム売上",
         "url": SR_ROOM_SALES_URL,
-        # FTPパスの末尾に使用するファイル名部分
+        # FTPパスの末尾に使用するファイル名部分 (ベース名)
         "filename": "point_hist_with_mixed_rate_csv_donwload_for_room.csv",
         "type": "room_sales"
     }
@@ -111,9 +111,12 @@ def get_target_months():
             dt_obj_jst = JST.localize(dt_naive, is_dst=None)
             
             # 3. UNIXタイムスタンプ（UTC基準）に変換
-            timestamp = int(dt_obj_jst.timestamp()) 
+            timestamp = int(dt_obj_jst.timestamp())
             
-            months.append((month_str, timestamp))
+            # YYYYMM形式の年月文字列も同時に格納
+            ym_str = f"{current_year}{current_month:02d}"
+            
+            months.append((month_str, timestamp, ym_str)) # タプルにym_strを追加
         except Exception as e:
             logging.error(f"日付計算エラー ({month_str}): {e}")
             
@@ -225,6 +228,7 @@ def fetch_and_process_data(timestamp, cookie_string, sr_url, data_type_key):
                 # '支払い金額（税抜）: <span class="fw-b"> 1,182,445円</span><br>'
                                 
                 # 支払い金額（税抜）の行を抽出
+                # total_amount_tagはpタグだが、BeautifulSoupはタグの中身を文字列化する際に子要素も含む
                 match = re.search(r'支払い金額（税抜）:\s*<span[^>]*>\s*([\d,]+)円', str(total_amount_tag))
                 
                 if match:
@@ -333,17 +337,29 @@ def upload_file_ftp(csv_buffer, ftp_config, full_target_path):
     return True
 
 
-def process_data_type(data_type_key, selected_timestamp, auth_cookie_string, ftp_config):
+def process_data_type(data_type_key, selected_timestamp, auth_cookie_string, ftp_config, is_bu_upload, ym_str):
     """
     指定されたデータタイプ（タイムチャージ、プレミアムライブ、またはルーム売上）の処理を実行する
+    is_bu_upload: BUファイルとしてアップロードするかどうか
+    ym_str: YYYYMM形式の年月文字列 (is_bu_uploadがTrueの場合に使用)
     """
     data_info = DATA_TYPES[data_type_key]
     data_label = data_info["label"]
     sr_url = data_info["url"]
-    filename = data_info["filename"]
+    base_filename = data_info["filename"] # 変更前の固定ファイル名
     
+    # ファイル名を決定: BUアップロードの場合、ファイル名に年月を追加
+    if is_bu_upload:
+        # ファイル名から '.csv' を削除し、'_YYYYMM.csv' を追加
+        filename_without_ext = base_filename.rsplit('.csv', 1)[0]
+        final_filename = f"{filename_without_ext}_{ym_str}.csv"
+        st.info(f"⚠️ BUファイルモードが有効です。ファイル名: **{final_filename}**")
+    else:
+        # 固定ファイル名を使用
+        final_filename = base_filename
+        
     # FTPアップロード先のフルパスを動的に生成
-    full_target_path = ftp_config["target_base_path"] + filename
+    full_target_path = ftp_config["target_base_path"] + final_filename
     
     #st.subheader(f"🔄 **{data_label}** の処理を開始します")
     st.markdown(f"##### 🔄 **{data_label}** の処理を開始します")
@@ -354,6 +370,7 @@ def process_data_type(data_type_key, selected_timestamp, auth_cookie_string, ftp
     if csv_buffer:
         # 2. FTPアップロード
         if ftp_config:
+            # full_target_pathが動的に決定されている
             upload_file_ftp(csv_buffer, ftp_config, full_target_path)
         else:
             st.error("FTP設定が読み込まれていないため、アップロードはスキップされました。")
@@ -376,42 +393,82 @@ def main():
     st.markdown("---")
 
     # 2. 月選択プルダウンの作成
-    month_options = get_target_months()
-    month_labels = [label for label, _ in month_options]
+    month_options_tuple = get_target_months()
+    # プルダウンのオプションにはラベルのみ使用
+    month_labels = [label for label, _, _ in month_options_tuple] 
     
     #st.header("1. 対象月選択")
     st.markdown("#### 1. 対象月選択")
     
+    # st.session_stateを使用して、選択月の変更時にチェックボックスをリセット
+    if 'selected_month_label' not in st.session_state:
+        st.session_state.selected_month_label = month_labels[0]
+    
+    # プルダウンウィジェット
     selected_label = st.selectbox(
         "処理対象の配信月を選択してください:",
         options=month_labels,
-        index=0 # デフォルトで最新の月を選択
+        index=month_labels.index(st.session_state.selected_month_label),
+        key="month_selector" # 制御用のキー
     )
     
-    selected_timestamp = next((ts for label, ts in month_options if label == selected_label), None)
-
+    # 選択された月が変更された場合、セッション状態を更新し、チェックボックスをリセット（後述）
+    if st.session_state.selected_month_label != selected_label:
+        st.session_state.selected_month_label = selected_label
+        # 月が変更された場合、チェックボックスの状態をFalseに設定する（リセット）
+        # ただし、チェックボックス自体は別の場所で定義する必要があるため、状態をセッションに保存
+        st.session_state.bu_upload_checkbox = False 
+        
+    # 選択された月に対応する timestamp と ym_str を取得
+    selected_data = next(((ts, ym) for label, ts, ym in month_options_tuple if label == selected_label), (None, None))
+    selected_timestamp = selected_data[0]
+    selected_ym_str = selected_data[1] # YYYYMM形式の年月
+    
     if selected_timestamp is None:
         st.warning("有効な月が選択されていません。")
         return
         
     st.info(f"選択された月: **{selected_label}** (UNIXタイムスタンプ: {selected_timestamp})")
-    
+
+    # --- BUファイルとしてアップロードするチェックボックス ---
+    # セッション状態から現在の値を読み込む
+    if 'bu_upload_checkbox' not in st.session_state:
+        st.session_state.bu_upload_checkbox = False 
+        
+    is_bu_upload = st.checkbox(
+        "📂 **BUファイルとしてアップロードする** (年月付きファイル名)",
+        value=st.session_state.bu_upload_checkbox,
+        key="bu_file_checkbox"
+    )
+    # チェックボックスの状態をセッションに保存（プルダウン変更時のリセットで使用）
+    st.session_state.bu_upload_checkbox = is_bu_upload
+
+
     #st.header("2. データ取得とアップロードの実行")
     st.markdown("#### 2. データ取得とアップロードの実行")
     
     # 3. 実行ボタン
     #if st.button("🚀 タイムチャージ売上 / プレミアムライブ売上 / ルーム売上の全てを取得・FTPアップロードを実行", type="primary"):
     if st.button("🚀 ルーム売上 / タイムチャージ売上 / プレミアムライブ売上の全てを取得・FTPアップロードを実行", type="primary"):
+        
+        if is_bu_upload:
+            st.warning(f"⚠️ BUファイルモード（年月: {selected_ym_str}）で実行します。ファイル名は固定ファイル名ではなく、年月が付与されます。")
+        else:
+            st.info("通常モードで実行します。ファイル名は固定ファイル名で上書きされます。")
+            
         with st.spinner(f"処理中: {selected_label}のデータを取得しています..."):
             
             # --- ルーム売上処理 ---
-            process_data_type("room_sales", selected_timestamp, AUTH_COOKIE_STRING, FTP_CONFIG)
+            # is_bu_uploadとselected_ym_strを渡す
+            process_data_type("room_sales", selected_timestamp, AUTH_COOKIE_STRING, FTP_CONFIG, is_bu_upload, selected_ym_str)
 
             # --- プレミアムライブ売上処理 ---
-            process_data_type("premium_live", selected_timestamp, AUTH_COOKIE_STRING, FTP_CONFIG)
+            # is_bu_uploadとselected_ym_strを渡す
+            process_data_type("premium_live", selected_timestamp, AUTH_COOKIE_STRING, FTP_CONFIG, is_bu_upload, selected_ym_str)
 
             # --- タイムチャージ売上処理 ---
-            process_data_type("time_charge", selected_timestamp, AUTH_COOKIE_STRING, FTP_CONFIG)            
+            # is_bu_uploadとselected_ym_strを渡す
+            process_data_type("time_charge", selected_timestamp, AUTH_COOKIE_STRING, FTP_CONFIG, is_bu_upload, selected_ym_str)            
 
         st.balloons()
         st.success("🎉 **全ての処理が完了しました！**")
