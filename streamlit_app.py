@@ -345,7 +345,8 @@ def process_data_type(data_type_key, selected_timestamp, auth_cookie_string, ftp
     # FTPアップロード先のフルパスを動的に生成
     full_target_path = ftp_config["target_base_path"] + filename
     
-    st.subheader(f"🔄 **{data_label}** の処理を開始します")
+    #st.subheader(f"🔄 **{data_label}** の処理を開始します")
+    st.markdown(f"##### 🔄 **{data_label}** の処理を開始します")
     
     # 1. データ取得と整形 (data_type_keyを渡す)
     csv_buffer = fetch_and_process_data(selected_timestamp, auth_cookie_string, sr_url, data_type_key)
