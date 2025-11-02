@@ -402,14 +402,14 @@ def main():
     if st.button("🚀 タイムチャージ売上 / プレミアムライブ売上 / ルーム売上の全てを取得・FTPアップロードを実行", type="primary"):
         with st.spinner(f"処理中: {selected_label}のデータを取得しています..."):
             
-            # --- タイムチャージ売上処理 ---
-            process_data_type("time_charge", selected_timestamp, AUTH_COOKIE_STRING, FTP_CONFIG)
-            
+            # --- ルーム売上処理 ---
+            process_data_type("room_sales", selected_timestamp, AUTH_COOKIE_STRING, FTP_CONFIG)
+
             # --- プレミアムライブ売上処理 ---
             process_data_type("premium_live", selected_timestamp, AUTH_COOKIE_STRING, FTP_CONFIG)
 
-            # --- ルーム売上処理 --- (追加)
-            process_data_type("room_sales", selected_timestamp, AUTH_COOKIE_STRING, FTP_CONFIG)
+            # --- タイムチャージ売上処理 ---
+            process_data_type("time_charge", selected_timestamp, AUTH_COOKIE_STRING, FTP_CONFIG)            
 
         st.balloons()
         st.success("🎉 **全ての処理が完了しました！**")
