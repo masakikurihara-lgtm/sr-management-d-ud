@@ -228,7 +228,6 @@ def fetch_and_process_data(timestamp, cookie_string, sr_url, data_type_key):
                 # '支払い金額（税抜）: <span class="fw-b"> 1,182,445円</span><br>'
                                 
                 # 支払い金額（税抜）の行を抽出
-                # total_amount_tagはpタグだが、BeautifulSoupはタグの中身を文字列化する際に子要素も含む
                 match = re.search(r'支払い金額（税抜）:\s*<span[^>]*>\s*([\d,]+)円', str(total_amount_tag))
                 
                 if match:
@@ -412,12 +411,13 @@ def main():
         key="month_selector" # 制御用のキー
     )
     
-    # 選択された月が変更された場合、セッション状態を更新し、チェックボックスをリセット（後述）
+    # 選択された月が変更された場合、セッション状態を更新し、チェックボックスをリセット
     if st.session_state.selected_month_label != selected_label:
         st.session_state.selected_month_label = selected_label
-        # 月が変更された場合、チェックボックスの状態をFalseに設定する（リセット）
-        # ただし、チェックボックス自体は別の場所で定義する必要があるため、状態をセッションに保存
-        st.session_state.bu_upload_checkbox = False 
+        # 月が変更された場合、チェックボックスのキーに対応するセッション状態をFalseに設定してリセット
+        # これにより、次にチェックボックスが描画される際に強制的にオフになる
+        if 'bu_file_checkbox' in st.session_state: # 念のため存在チェック
+            st.session_state.bu_file_checkbox = False # <--- 修正箇所
         
     # 選択された月に対応する timestamp と ym_str を取得
     selected_data = next(((ts, ym) for label, ts, ym in month_options_tuple if label == selected_label), (None, None))
@@ -427,21 +427,25 @@ def main():
     if selected_timestamp is None:
         st.warning("有効な月が選択されていません。")
         return
-        
+
     st.info(f"選択された月: **{selected_label}** (UNIXタイムスタンプ: {selected_timestamp})")
 
     # --- BUファイルとしてアップロードするチェックボックス ---
-    # セッション状態から現在の値を読み込む
-    if 'bu_upload_checkbox' not in st.session_state:
-        st.session_state.bu_upload_checkbox = False 
+    # keyを指定し、Streamlitの自動状態管理に任せることで、上記のリセット処理が有効になる
+    
+    # 初回アクセス時の初期化 (key名を使用)
+    if 'bu_file_checkbox' not in st.session_state:
+        st.session_state.bu_file_checkbox = False 
         
-    is_bu_upload = st.checkbox(
+    st.checkbox(
         "📂 **BUファイルとしてアップロードする** (年月付きファイル名)",
-        value=st.session_state.bu_upload_checkbox,
-        key="bu_file_checkbox"
+        key="bu_file_checkbox" # keyを指定
     )
-    # チェックボックスの状態をセッションに保存（プルダウン変更時のリセットで使用）
-    st.session_state.bu_upload_checkbox = is_bu_upload
+    
+    # 値の読み出しはセッション状態から行う
+    is_bu_upload = st.session_state.bu_file_checkbox # <--- 修正箇所
+    # is_bu_upload変数を後続の処理のために定義
+    
 
 
     #st.header("2. データ取得とアップロードの実行")
